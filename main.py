@@ -5,17 +5,18 @@ LLM Plugin Bridge - LLM 插件桥
 - 发现和了解所有可用的插件和指令
 - 获取唤醒词和触发方式信息
 - 执行插件指令（可配置权限控制）
-- 监控工具调用历史
+- 判断用户意图，避免重复执行
 
 功能特性：
 1. 提供 LLM Tool 查询指令和插件信息
 2. 提供 LLM Tool 执行插件指令
-3. 支持指令黑白名单、自定义描述等高级配置
-4. 记录工具调用历史，便于调试和审计
+3. 支持指令黑白名单等高级配置
+4. 监听指令调用，帮助 LLM 判断用户意图
 """
 
 import inspect
 import json
+import time
 from typing import Any
 
 from astrbot.api import logger, star
@@ -38,7 +39,12 @@ class Main(star.Star):
         self._commands_cache: dict[str, dict] = {}
         self._plugins_cache: dict[str, dict] = {}
         self._wake_prefix: str = ""
-        self._tool_call_history: list[dict] = []
+
+        # ========== 调用记录 ==========
+        # 记录最近的指令调用（用户通过唤醒词+指令触发）
+        self._recent_command_invocations: list[dict] = []
+        # 记录最近的 LLM 工具调用
+        self._recent_llm_tool_calls: list[dict] = []
 
         # ========== 执行相关配置 ==========
         self._allow_execute = self._config.get("allow_execute", True)
@@ -46,7 +52,7 @@ class Main(star.Star):
         self._blocked_commands = set(self._config.get("blocked_commands", []))
 
         # ========== 列表过滤配置 ==========
-        self._list_mode = self._config.get("list_mode", "all")  # all, whitelist, blacklist
+        self._list_mode = self._config.get("list_mode", "all")
         self._command_whitelist = set(self._config.get("command_whitelist", []))
         self._command_blacklist = set(self._config.get("command_blacklist", []))
 
@@ -71,7 +77,6 @@ class Main(star.Star):
         logger.info(f"  - 唤醒词: {self._get_wake_prefix_display()}")
         logger.info(f"  - 列表模式: {self._list_mode}")
         logger.info(f"  - LLM 执行功能: {'已启用' if self._allow_execute else '已禁用'}")
-        logger.info(f"  - 工具调用日志: {'已启用' if self._enable_tool_logging else '已禁用'}")
 
     def _log(self, message: str, level: str = "info"):
         """根据配置的日志级别输出日志"""
@@ -103,13 +108,11 @@ class Main(star.Star):
         """刷新指令缓存"""
         self._commands_cache.clear()
 
-        # 获取所有消息事件处理器
         handlers = star_handlers_registry.get_handlers_by_event_type(
             EventType.AdapterMessageEvent, only_activated=True
         )
 
         for handler_md in handlers:
-            # 查找 CommandFilter
             command_filter = None
             for event_filter in handler_md.event_filters:
                 if isinstance(event_filter, CommandFilter):
@@ -119,15 +122,12 @@ class Main(star.Star):
             if not command_filter:
                 continue
 
-            # 获取指令名称
             cmd_names = command_filter.get_complete_command_names()
             if not cmd_names:
                 continue
 
-            # 获取主指令名
             primary_name = command_filter.command_name
 
-            # 获取参数信息
             params_info = {}
             for param_name, param_type in command_filter.handler_params.items():
                 if isinstance(param_type, type):
@@ -144,7 +144,6 @@ class Main(star.Star):
                         "required": False,
                     }
 
-            # 获取插件信息
             plugin_info = None
             if not self._hide_plugin_info:
                 for star_md in self.context.get_all_stars():
@@ -156,12 +155,10 @@ class Main(star.Star):
                         }
                         break
 
-            # 获取描述（支持自定义）
             description = self._get_command_description(
                 primary_name, handler_md.desc or "无描述"
             )
 
-            # 存储指令信息
             self._commands_cache[primary_name] = {
                 "names": cmd_names,
                 "primary_name": primary_name,
@@ -174,13 +171,11 @@ class Main(star.Star):
                 "is_custom": False,
             }
 
-        # 添加自定义指令
         for custom_cmd in self._custom_commands:
             cmd_name = custom_cmd.get("name")
             if not cmd_name:
                 continue
 
-            # 解析参数
             params_info = {}
             if "params" in custom_cmd:
                 for param_name, param_info in custom_cmd["params"].items():
@@ -223,55 +218,46 @@ class Main(star.Star):
     # ==================== 辅助方法 ====================
 
     def _get_wake_prefix_display(self) -> str:
-        """获取用于显示的唤醒词"""
         if self._wake_prefix:
             return self._wake_prefix
         return "无唤醒词（@机器人 或私聊即可触发）"
 
     def _get_command_prefix(self) -> str:
-        """获取指令前缀（用于生成示例）"""
         if self._wake_prefix:
             return self._wake_prefix
         return "/"
 
     def _is_command_visible(self, cmd_name: str) -> bool:
-        """检查指令是否应该显示在列表中"""
         if self._list_mode == "whitelist":
             return cmd_name in self._command_whitelist
         elif self._list_mode == "blacklist":
             return cmd_name not in self._command_blacklist
-        else:  # all
+        else:
             return True
 
     def _is_command_executable(self, cmd_name: str) -> bool:
-        """检查指令是否可以被 LLM 执行"""
         return cmd_name not in self._blocked_commands
 
     def _get_command_description(self, cmd_name: str, default_desc: str) -> str:
-        """获取指令描述（支持自定义覆盖）"""
         if cmd_name in self._custom_descriptions:
             return self._custom_descriptions[cmd_name]
         return default_desc
 
     def _generate_usage_examples(self, cmd_info: dict) -> list[str]:
-        """生成指令使用示例列表"""
         primary_name = cmd_info["primary_name"]
         params = cmd_info["params"]
         prefix = self._get_command_prefix()
 
         examples = []
 
-        # 基本用法
         if not params:
             examples.append(f"{prefix}{primary_name}")
         else:
-            # 带参数的用法
             param_strs = []
             example_values = []
             for param_name, param_info in params.items():
                 if param_info.get("required", True):
                     param_strs.append(f"<{param_name}>")
-                    # 根据参数类型生成示例值
                     param_type = param_info.get("type", "str")
                     if param_type == "int":
                         example_values.append("1")
@@ -290,7 +276,96 @@ class Main(star.Star):
 
         return examples
 
+    def _add_command_invocation(self, command_name: str, args: str, sender_id: str, message_str: str):
+        """记录指令调用（用户通过唤醒词+指令触发）"""
+        invocation = {
+            "command": command_name,
+            "args": args,
+            "sender_id": sender_id,
+            "message_str": message_str[:200] if message_str else "",
+            "timestamp": time.time(),
+        }
+        self._recent_command_invocations.append(invocation)
+        
+        # 保持最近 50 条记录
+        if len(self._recent_command_invocations) > 50:
+            self._recent_command_invocations = self._recent_command_invocations[-30:]
+        
+        self._log(f"[Command Invocation] 用户执行指令: {command_name} {args}")
+
+    def _add_llm_tool_call(self, tool_name: str, tool_args: dict | None, sender_id: str):
+        """记录 LLM 工具调用"""
+        call = {
+            "tool": tool_name,
+            "args": tool_args,
+            "sender_id": sender_id,
+            "timestamp": time.time(),
+        }
+        self._recent_llm_tool_calls.append(call)
+        
+        if len(self._recent_llm_tool_calls) > 50:
+            self._recent_llm_tool_calls = self._recent_llm_tool_calls[-30:]
+        
+        self._log(f"[LLM Tool Call] 工具 '{tool_name}' 被调用")
+
+    def _check_user_intent(self, sender_id: str, message_str: str, time_window: float = 5.0) -> dict:
+        """
+        检查用户意图：判断用户是否已经通过指令方式触发了功能
+        
+        返回：
+        - has_command: 是否有指令调用
+        - command_info: 指令调用信息
+        - should_skip_llm_execution: LLM 是否应该跳过执行
+        """
+        current_time = time.time()
+        
+        # 查找最近的指令调用
+        for invocation in reversed(self._recent_command_invocations):
+            # 检查时间窗口（5秒内）
+            if current_time - invocation["timestamp"] > time_window:
+                break
+            
+            # 检查是否是同一用户
+            if invocation["sender_id"] == sender_id:
+                # 检查消息内容是否匹配
+                if invocation["message_str"] and message_str:
+                    # 如果消息内容相似，说明用户是通过指令触发的
+                    return {
+                        "has_command": True,
+                        "command_info": {
+                            "command": invocation["command"],
+                            "args": invocation["args"],
+                        },
+                        "should_skip_llm_execution": True,
+                        "reason": f"用户已通过指令「{invocation['command']}」触发了该功能，LLM 不应重复执行。",
+                    }
+        
+        return {
+            "has_command": False,
+            "command_info": None,
+            "should_skip_llm_execution": False,
+            "reason": None,
+        }
+
     # ==================== LLM 工具 ====================
+
+    @filter.llm_tool(name="check_user_intent")
+    async def check_user_intent(self, event: AstrMessageEvent) -> str:
+        """检查用户意图，判断用户是否已经通过指令方式触发了功能。在执行任何可能重复的操作之前调用此工具。
+
+        返回信息包括：
+        - 用户是否已通过指令触发
+        - 触发的指令信息
+        - LLM 是否应该跳过执行
+        """
+        self._log("[LLM Tool] check_user_intent 被调用")
+        
+        sender_id = event.get_sender_id()
+        message_str = event.message_str or ""
+        
+        result = self._check_user_intent(sender_id, message_str)
+        
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="get_wake_info")
     async def get_wake_info(self, event: AstrMessageEvent) -> str:
@@ -311,7 +386,6 @@ class Main(star.Star):
             "examples": [],
         }
 
-        # 构建触发方式说明
         if self._wake_prefix:
             result["trigger_methods"].append(
                 f"发送「{self._wake_prefix}」开头的消息"
@@ -362,11 +436,9 @@ class Main(star.Star):
 
         commands = []
         for cmd_name, cmd_info in self._commands_cache.items():
-            # 黑白名单过滤
             if not self._is_command_visible(cmd_name):
                 continue
 
-            # 插件过滤
             if plugin_name:
                 cmd_plugin = cmd_info.get("plugin", {})
                 if cmd_plugin:
@@ -375,7 +447,6 @@ class Main(star.Star):
                 else:
                     continue
 
-            # 关键词过滤
             if keyword:
                 keyword_lower = keyword.lower()
                 if (
@@ -384,32 +455,26 @@ class Main(star.Star):
                 ):
                     continue
 
-            # 构建指令信息
             cmd_entry = {
                 "name": cmd_name,
                 "description": cmd_info["description"],
             }
 
-            # 是否显示完整指令（带唤醒词前缀）
             if self._show_wake_prefix_in_list:
                 cmd_entry["full_command"] = f"{self._get_command_prefix()}{cmd_name}"
 
-            # 别名
             aliases = [
                 n for n in cmd_info["names"] if n != cmd_name and not n.startswith(" ")
             ]
             if aliases:
                 cmd_entry["aliases"] = aliases
 
-            # 参数
             if include_params and cmd_info["params"]:
                 cmd_entry["params"] = cmd_info["params"]
 
-            # 插件信息
             if cmd_info["plugin"] and not self._hide_plugin_info:
                 cmd_entry["plugin"] = cmd_info["plugin"]["name"]
 
-            # 是否可执行
             if cmd_info["is_custom"]:
                 cmd_entry["is_custom"] = True
             else:
@@ -429,7 +494,6 @@ class Main(star.Star):
             "commands": commands,
         }
 
-        # 添加唤醒词信息
         if self._show_wake_prefix_in_list:
             result["wake_prefix"] = self._wake_prefix if self._wake_prefix else "无（使用 / 或 @机器人）"
             result["command_prefix"] = self._get_command_prefix()
@@ -451,7 +515,6 @@ class Main(star.Star):
         self._refresh_commands_cache()
         self._refresh_wake_prefix()
 
-        # 查找指令
         cmd_info = None
         for name, info in self._commands_cache.items():
             if name == command_name or command_name in info["names"]:
@@ -459,7 +522,6 @@ class Main(star.Star):
                 break
 
         if not cmd_info:
-            # 尝试模糊匹配
             similar = [
                 name
                 for name in self._commands_cache.keys()
@@ -469,7 +531,6 @@ class Main(star.Star):
                 return f"未找到指令「{command_name}」。您是否要找: {', '.join(similar)}？"
             return f"未找到指令「{command_name}」。使用 list_commands 工具查看所有可用指令。"
 
-        # 构建详细信息
         result = {
             "name": cmd_info["primary_name"],
             "full_command": f"{self._get_command_prefix()}{cmd_info['primary_name']}",
@@ -483,17 +544,14 @@ class Main(star.Star):
             "params": cmd_info["params"] if cmd_info["params"] else None,
         }
 
-        # 插件信息
         if cmd_info["plugin"] and not self._hide_plugin_info:
             result["plugin"] = cmd_info["plugin"]
 
-        # 使用示例
         if cmd_info["is_custom"] and cmd_info.get("example"):
             result["usage_examples"] = [cmd_info["example"]]
         else:
             result["usage_examples"] = self._generate_usage_examples(cmd_info)
 
-        # 是否可执行
         if cmd_info["is_custom"]:
             result["is_custom"] = True
             result["note"] = "这是一个自定义指令，仅用于展示，无法通过 execute_command 执行。"
@@ -506,13 +564,7 @@ class Main(star.Star):
 
     @filter.llm_tool(name="list_plugins")
     async def list_plugins(self, event: AstrMessageEvent) -> str:
-        """列出所有已加载的插件。当用户想知道有哪些插件、想了解插件概况时调用此工具。
-
-        返回信息包括：
-        - 插件名称、作者、版本
-        - 插件描述
-        - 激活状态
-        """
+        """列出所有已加载的插件。当用户想知道有哪些插件、想了解插件概况时调用此工具。"""
         self._log("[LLM Tool] list_plugins 被调用")
         self._refresh_plugins_cache()
 
@@ -549,7 +601,6 @@ class Main(star.Star):
         self._refresh_plugins_cache()
         self._refresh_commands_cache()
 
-        # 查找插件
         plugin_info = None
         for name, info in self._plugins_cache.items():
             if name.lower() == plugin_name.lower():
@@ -565,7 +616,6 @@ class Main(star.Star):
                 return f"未找到插件「{plugin_name}」。您是否要找: {', '.join(similar)}？"
             return f"未找到插件「{plugin_name}」。使用 list_plugins 工具查看所有可用插件。"
 
-        # 获取该插件注册的指令
         plugin_commands = []
         for cmd_name, cmd_info in self._commands_cache.items():
             if cmd_info.get("plugin", {}).get("name", "").lower() == plugin_info["name"].lower():
@@ -585,11 +635,11 @@ class Main(star.Star):
             "activated": plugin_info.get("activated", False),
             "repo": plugin_info.get("repo", ""),
             "commands_count": len(plugin_commands),
-            "commands": plugin_commands[:10] if plugin_commands else [],  # 最多返回10个
+            "commands": plugin_commands[:10] if plugin_commands else [],
         }
 
         if len(plugin_commands) > 10:
-            result["note"] = f"该插件注册了 {len(plugin_commands)} 个指令，此处仅显示前10个。使用 list_commands 工具并指定 plugin_name 参数可以查看完整列表。"
+            result["note"] = f"该插件注册了 {len(plugin_commands)} 个指令，此处仅显示前10个。"
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -602,24 +652,30 @@ class Main(star.Star):
     ) -> str:
         """执行指定的插件指令。当用户明确要求执行某个指令，或者 LLM 认为需要通过执行指令来完成任务时调用此工具。
 
+        重要：在执行之前，请先调用 check_user_intent 工具检查用户是否已经通过指令方式触发了该功能。
+
         Args:
             command_name(string): 要执行的指令名称（不需要带唤醒词前缀）。
             args(string): 指令参数，多个参数用空格分隔。如 "北京 天气" 表示两个参数。
         """
         self._log(f"[LLM Tool] execute_command 被调用, command_name={command_name}, args={args}")
 
-        # 检查是否允许执行
+        # 检查用户意图
+        sender_id = event.get_sender_id()
+        message_str = event.message_str or ""
+        intent = self._check_user_intent(sender_id, message_str)
+        
+        if intent["should_skip_llm_execution"]:
+            return f"跳过执行：{intent['reason']}"
+
         if not self._allow_execute:
             return "错误：LLM 指令执行功能已被禁用。"
 
-        # 检查权限
         if self._execute_require_admin and not event.is_admin():
             return "错误：执行指令需要管理员权限。"
 
-        # 刷新缓存
         self._refresh_commands_cache()
 
-        # 查找指令
         cmd_info = None
         for name, info in self._commands_cache.items():
             if name == command_name or command_name in info["names"]:
@@ -629,20 +685,16 @@ class Main(star.Star):
         if not cmd_info:
             return f"错误：未找到指令「{command_name}」。"
 
-        # 检查是否是自定义指令
         if cmd_info.get("is_custom"):
             return "错误：自定义指令无法通过 execute_command 执行。"
 
-        # 检查是否在执行黑名单中
         if not self._is_command_executable(command_name):
             return f"错误：指令「{command_name}」已被禁止通过 LLM 执行。"
 
         try:
-            # 获取处理器和过滤器
             handler_md = cmd_info["handler_md"]
             command_filter = cmd_info["command_filter"]
 
-            # 解析参数
             args_list = args.split() if args else []
             try:
                 parsed_params = command_filter.validate_and_convert_params(
@@ -652,34 +704,25 @@ class Main(star.Star):
                 examples = self._generate_usage_examples(cmd_info)
                 return f"参数错误: {str(e)}\n使用示例: {examples[0] if examples else '无'}"
 
-            # 获取插件实例
             from astrbot.core.star.star import star_map
 
             star_info = star_map.get(handler_md.handler_module_path)
             if not star_info or not star_info.star_cls_type:
                 return "错误：无法获取插件实例。"
 
-            # 调用处理器
             handler = handler_md.handler
-
-            # 设置解析后的参数到 event
             event.set_extra("parsed_params", parsed_params)
 
-            # 调用处理器（需要处理不同类型的返回值）
             result = handler(event, **parsed_params)
 
-            # 检查是否是异步生成器
             if inspect.isasyncgen(result):
-                # 异步生成器，需要迭代
                 last_item = None
                 async for item in result:
                     last_item = item
                 result = last_item
             elif inspect.iscoroutine(result):
-                # 协程，需要 await
                 result = await result
 
-            # 处理返回结果
             if result is not None:
                 if isinstance(result, MessageEventResult):
                     plain_text = result.get_plain_text()
@@ -691,7 +734,6 @@ class Main(star.Star):
                 else:
                     return "指令执行成功。"
 
-            # 检查 event 是否设置了结果
             event_result = event.get_result()
             if event_result:
                 plain_text = event_result.get_plain_text()
@@ -713,52 +755,32 @@ class Main(star.Star):
         if not self._enable_tool_logging:
             return
 
-        tool_info = {
-            "event": "tool_call_start",
-            "tool_name": tool.name if tool else "unknown",
-            "tool_args": tool_args,
-            "message_str": event.message_str[:200] if event.message_str else "",
-            "sender_id": event.get_sender_id(),
-            "sender_name": event.get_sender_name(),
-        }
-
-        self._tool_call_history.append(tool_info)
-
-        # 保持历史记录在合理范围内
-        if len(self._tool_call_history) > 100:
-            self._tool_call_history = self._tool_call_history[-50:]
-
-        self._log(f"[Tool Call] 工具 '{tool.name}' 被调用, 参数: {json.dumps(tool_args, ensure_ascii=False) if tool_args else '无'}")
+        sender_id = event.get_sender_id()
+        self._add_llm_tool_call(tool.name if tool else "unknown", tool_args, sender_id)
 
     @filter.on_llm_tool_respond()
     async def on_llm_tool_respond(self, event: AstrMessageEvent, tool: FunctionTool, tool_args: dict | None, tool_result: Any):
         """监听 LLM Tool 响应事件"""
-        if not self._enable_tool_logging:
-            return
+        pass  # 不需要额外处理
 
-        # 处理 tool_result
-        result_str = ""
-        if tool_result:
-            try:
-                if hasattr(tool_result, 'content'):
-                    result_str = str(tool_result.content)[:500]
-                elif hasattr(tool_result, '__dict__'):
-                    result_str = json.dumps(tool_result.__dict__, ensure_ascii=False, default=str)[:500]
-                else:
-                    result_str = str(tool_result)[:500]
-            except Exception as e:
-                result_str = f"<无法序列化: {e}>"
-
-        tool_info = {
-            "event": "tool_call_end",
-            "tool_name": tool.name if tool else "unknown",
-            "tool_args": tool_args,
-            "tool_result": result_str,
-        }
-
-        self._tool_call_history.append(tool_info)
-
-        self._log(f"[Tool Respond] 工具 '{tool.name}' 返回结果: {result_str[:200] if result_str else '空'}")
+    @filter.on_command_run()
+    async def on_command_run(self, event: AstrMessageEvent):
+        """监听指令执行事件 - 记录用户通过指令触发的行为"""
+        # 获取执行的指令信息
+        parsed_params = event.get_extra("parsed_params") or {}
+        command_name = event.get_extra("command_name") or ""
+        
+        if command_name:
+            # 构建参数字符串
+            args_str = " ".join(str(v) for v in parsed_params.values()) if parsed_params else ""
+            
+            # 记录指令调用
+            self._add_command_invocation(
+                command_name=command_name,
+                args=args_str,
+                sender_id=event.get_sender_id(),
+                message_str=event.message_str,
+            )
 
     # ==================== 用户指令 ====================
 
@@ -767,7 +789,6 @@ class Main(star.Star):
         """显示当前插件配置"""
         lines = ["⚙️ LLM Plugin Bridge 配置信息", ""]
 
-        # 执行配置
         lines.append("【执行配置】")
         lines.append(f"  允许 LLM 执行: {'✅' if self._allow_execute else '❌'}")
         lines.append(f"  执行需管理员权限: {'✅' if self._execute_require_admin else '❌'}")
@@ -777,7 +798,6 @@ class Main(star.Star):
             lines.append("  禁止执行的指令: 无")
         lines.append("")
 
-        # 列表过滤配置
         lines.append("【列表过滤配置】")
         mode_desc = {
             "all": "显示所有指令",
@@ -792,26 +812,15 @@ class Main(star.Star):
             lines.append(f"  黑名单指令: {', '.join(self._command_blacklist)}")
         lines.append("")
 
-        # 自定义配置
-        lines.append("【自定义配置】")
-        lines.append(f"  自定义描述数量: {len(self._custom_descriptions)}")
-        lines.append(f"  自定义指令数量: {len(self._custom_commands)}")
-        lines.append(f"  隐藏插件来源: {'✅' if self._hide_plugin_info else '❌'}")
-        lines.append(f"  列表显示唤醒词前缀: {'✅' if self._show_wake_prefix_in_list else '❌'}")
+        lines.append("【调用记录】")
+        lines.append(f"  最近指令调用: {len(self._recent_command_invocations)} 条")
+        lines.append(f"  最近LLM工具调用: {len(self._recent_llm_tool_calls)} 条")
         lines.append("")
 
-        # 日志配置
-        lines.append("【日志配置】")
-        lines.append(f"  工具调用日志: {'✅' if self._enable_tool_logging else '❌'}")
-        lines.append(f"  日志级别: {self._log_level}")
-        lines.append("")
-
-        # 缓存状态
         lines.append("【缓存状态】")
         lines.append(f"  指令数量: {len(self._commands_cache)}")
         lines.append(f"  插件数量: {len(self._plugins_cache)}")
         lines.append(f"  当前唤醒词: {self._get_wake_prefix_display()}")
-        lines.append(f"  工具调用历史: {len(self._tool_call_history)} 条记录")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
@@ -845,7 +854,6 @@ class Main(star.Star):
         prefix = self._get_command_prefix() if self._show_wake_prefix_in_list else ""
         lines = ["📋 可用指令列表：", ""]
 
-        # 按插件分组
         plugins_commands = {}
         for cmd_name, cmd_info in sorted(visible_commands.items()):
             pn = cmd_info.get("plugin", {}).get("name", "其他") if cmd_info.get("plugin") else "其他"
@@ -862,7 +870,6 @@ class Main(star.Star):
 
                 cmd_display = f"{prefix}{cmd_name}" if prefix else cmd_name
 
-                # 标记
                 marks = []
                 if cmd_info.get("is_custom"):
                     marks.append("自定义")
@@ -894,7 +901,6 @@ class Main(star.Star):
         self._refresh_commands_cache()
         self._refresh_wake_prefix()
 
-        # 查找指令
         cmd_info = None
         for name, info in self._commands_cache.items():
             if name == command_name or command_name in info["names"]:
@@ -916,7 +922,6 @@ class Main(star.Star):
             f"描述：{cmd_info['description']}",
         ]
 
-        # 标记
         if cmd_info.get("is_custom"):
             lines.append("类型：自定义指令（仅展示）")
         elif not self._is_command_executable(cmd_info['primary_name']):
@@ -993,7 +998,6 @@ class Main(star.Star):
         self._refresh_plugins_cache()
         self._refresh_commands_cache()
 
-        # 查找插件
         plugin_info = None
         for name, info in self._plugins_cache.items():
             if name.lower() == plugin_name.lower():
@@ -1008,7 +1012,6 @@ class Main(star.Star):
             )
             return
 
-        # 获取该插件的指令
         plugin_commands = []
         for cmd_name, cmd_info in self._commands_cache.items():
             if cmd_info.get("plugin", {}).get("name", "").lower() == plugin_info["name"].lower():
@@ -1073,31 +1076,6 @@ class Main(star.Star):
             lines.append("  • @机器人 帮助 - @后发送指令")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
-
-    @filter.command("lpb_history", alias={"工具历史"})
-    async def show_tool_history(self, event: AstrMessageEvent):
-        """查看工具调用历史"""
-        if not self._tool_call_history:
-            event.set_result(
-                MessageEventResult().message("暂无工具调用历史记录。").use_t2i(False)
-            )
-            return
-
-        history_lines = ["📜 工具调用历史（最近20条）：", ""]
-
-        for record in self._tool_call_history[-20:]:
-            if record['event'] == 'tool_call_start':
-                args_str = json.dumps(record['tool_args'], ensure_ascii=False) if record['tool_args'] else '无'
-                history_lines.append(f"📞 调用 `{record['tool_name']}`")
-                history_lines.append(f"   参数: {args_str[:100]}{'...' if len(args_str) > 100 else ''}")
-            else:
-                result_str = record.get('tool_result', '无')[:100]
-                history_lines.append(f"   ↳ 返回: {result_str}{'...' if len(record.get('tool_result', '')) > 100 else ''}")
-            history_lines.append("")
-
-        history_lines.append(f"共 {len(self._tool_call_history)} 条历史记录")
-
-        event.set_result(MessageEventResult().message("\n".join(history_lines)).use_t2i(False))
 
     async def terminate(self) -> None:
         """插件卸载"""
