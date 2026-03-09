@@ -35,8 +35,10 @@ class Main(star.Star):
         self._wake_prefix: str = ""
 
         # ========== 消息历史记录 ==========
+        # key: session_id, value: list of message records
         self._message_history: dict[str, list[dict]] = {}
-        self._max_history_per_session = 20
+        # 每个会话保留的最大消息数（30轮 = 60条消息）
+        self._max_history_per_session = 60
 
         # ========== 调用记录 ==========
         self._recent_command_invocations: list[dict] = []
@@ -299,24 +301,32 @@ class Main(star.Star):
         
         return event.message_str or ""
 
-    def _save_message_history(self, session_id: str, original_message: str, processed_message: str, sender_id: str, sender_name: str):
-        """保存消息历史"""
+    def _save_message_to_history(self, session_id: str, role: str, content: str, sender_name: str = ""):
+        """保存消息到历史记录
+        
+        Args:
+            session_id: 会话ID
+            role: 角色 (user/assistant)
+            content: 消息内容
+            sender_name: 发送者名称
+        """
         if session_id not in self._message_history:
             self._message_history[session_id] = []
         
         record = {
-            "original_message": original_message,
-            "processed_message": processed_message,
-            "sender_id": sender_id,
+            "role": role,
+            "content": content,
             "sender_name": sender_name,
             "timestamp": time.time(),
         }
         
         self._message_history[session_id].append(record)
         
+        # 保持历史记录在限制内
         if len(self._message_history[session_id]) > self._max_history_per_session:
             self._message_history[session_id] = self._message_history[session_id][-self._max_history_per_session:]
         
+        # 清理过期的会话记录（30分钟无活动）
         current_time = time.time()
         expired_sessions = [
             sid for sid, records in self._message_history.items()
@@ -325,7 +335,7 @@ class Main(star.Star):
         for sid in expired_sessions:
             del self._message_history[sid]
 
-    def _get_message_history(self, session_id: str, limit: int = 5) -> list[dict]:
+    def _get_message_history(self, session_id: str, limit: int = 10) -> list[dict]:
         """获取消息历史"""
         if session_id not in self._message_history:
             return []
@@ -408,7 +418,6 @@ class Main(star.Star):
         - 用户发送的原始消息（包含唤醒词）
         - LLM 收到的消息（去掉唤醒词后）
         - 最近的消息历史
-        - 用户意图分析
         """
         self._log("[LLM Tool] get_wake_info 被调用")
         self._refresh_wake_prefix()
@@ -419,7 +428,8 @@ class Main(star.Star):
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name()
 
-        self._save_message_history(session_id, raw_message, llm_received_message, sender_id, sender_name)
+        # 保存当前用户消息
+        self._save_message_to_history(session_id, "user", raw_message, sender_name)
 
         result = {
             "wake_prefix": self._wake_prefix if self._wake_prefix else None,
@@ -432,51 +442,17 @@ class Main(star.Star):
             },
         }
 
-        # 获取最近的消息历史
-        history = self._get_message_history(session_id, limit=5)
-        if history:
+        # 获取最近的消息历史（不包括当前消息）
+        history = self._get_message_history(session_id, limit=61)  # 30轮 = 60条 + 当前1条
+        if len(history) > 1:
             result["recent_history"] = [
                 {
-                    "original_message": h["original_message"],
-                    "processed_message": h["processed_message"],
+                    "role": h["role"],
+                    "content": h["content"],
                     "sender_name": h["sender_name"],
-                    "time_ago": f"{int(time.time() - h['timestamp'])}秒前",
                 }
-                for h in history[:-1]
+                for h in history[:-1]  # 不包括当前消息
             ]
-
-        # 分析用户意图
-        wake = self._wake_prefix or ""
-        
-        if wake and raw_message.startswith(wake):
-            after_wake = raw_message[len(wake):]
-            
-            is_command = False
-            command_name = None
-            
-            for cmd_name in self._commands_cache.keys():
-                if after_wake.strip().startswith(cmd_name) or after_wake.strip() == cmd_name:
-                    is_command = True
-                    command_name = cmd_name
-                    break
-            
-            if is_command:
-                result["analysis"] = {
-                    "is_known_command": True,
-                    "command_name": command_name,
-                    "possible_intent": f"用户想执行「{command_name}」指令",
-                }
-            else:
-                result["analysis"] = {
-                    "is_known_command": False,
-                    "possible_intent": "用户可能是在问问题或进行普通对话，而不是执行指令",
-                    "content_after_wake": after_wake,
-                }
-        else:
-            result["analysis"] = {
-                "is_known_command": False,
-                "possible_intent": "消息不以唤醒词开头",
-            }
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -766,14 +742,50 @@ class Main(star.Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, request: Any):
-        """监听 LLM 请求事件 - 保存消息历史"""
+        """监听 LLM 请求事件 - 保存用户消息"""
         session_id = event.session_id
         raw_message = self._get_raw_message(event)
-        llm_received_message = event.message_str or ""
-        sender_id = event.get_sender_id()
         sender_name = event.get_sender_name()
         
-        self._save_message_history(session_id, raw_message, llm_received_message, sender_id, sender_name)
+        self._save_message_to_history(session_id, "user", raw_message, sender_name)
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, response: Any):
+        """监听 LLM 响应事件 - 保存助手消息"""
+        session_id = event.session_id
+        
+        # 尝试获取响应内容
+        response_text = ""
+        if response:
+            if hasattr(response, 'completion_text'):
+                response_text = response.completion_text
+            elif hasattr(response, 'text'):
+                response_text = response.text
+            elif isinstance(response, str):
+                response_text = response
+            elif isinstance(response, dict):
+                response_text = response.get('text', '') or response.get('content', '')
+        
+        if response_text:
+            self._save_message_to_history(session_id, "assistant", response_text, "机器人")
+
+    @filter.after_message_sent()
+    async def after_message_sent(self, event: AstrMessageEvent, result: MessageEventResult):
+        """监听消息发送事件 - 保存机器人发送的消息"""
+        session_id = event.session_id
+        
+        # 获取发送的消息内容
+        if result and result.chain:
+            texts = []
+            for component in result.chain:
+                if hasattr(component, 'text'):
+                    texts.append(component.text)
+                elif hasattr(component, 'data') and isinstance(component.data, dict):
+                    texts.append(component.data.get('text', ''))
+            
+            message_text = ''.join(texts)
+            if message_text:
+                self._save_message_to_history(session_id, "assistant", message_text, "机器人")
 
     # ==================== 用户指令 ====================
 
