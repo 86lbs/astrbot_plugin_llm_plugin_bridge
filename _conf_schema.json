@@ -12,7 +12,10 @@
   "blocked_commands": {
     "type": "list",
     "description": "禁止 LLM 执行的指令名称列表（执行黑名单）",
-    "default": []
+    "default": [],
+    "items": {
+      "type": "string"
+    }
   },
   "list_mode": {
     "type": "string",
@@ -22,12 +25,18 @@
   "command_whitelist": {
     "type": "list",
     "description": "白名单模式下，只显示这些指令",
-    "default": []
+    "default": [],
+    "items": {
+      "type": "string"
+    }
   },
   "command_blacklist": {
     "type": "list",
     "description": "黑名单模式下，隐藏这些指令",
-    "default": []
+    "default": [],
+    "items": {
+      "type": "string"
+    }
   },
   "custom_descriptions": {
     "type": "object",
@@ -37,7 +46,10 @@
   "custom_commands": {
     "type": "list",
     "description": "添加自定义指令信息（仅展示，不会真正注册指令）",
-    "default": []
+    "default": [],
+    "items": {
+      "type": "object"
+    }
   },
   "hide_plugin_info": {
     "type": "bool",
