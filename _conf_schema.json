@@ -1,0 +1,62 @@
+{
+  "allow_execute": {
+    "type": "bool",
+    "description": "是否允许 LLM 通过工具执行插件指令",
+    "default": true
+  },
+  "execute_require_admin": {
+    "type": "bool",
+    "description": "LLM 执行指令时是否需要用户具有管理员权限",
+    "default": false
+  },
+  "blocked_commands": {
+    "type": "list",
+    "description": "禁止 LLM 执行的指令名称列表（执行黑名单）",
+    "default": []
+  },
+  "list_mode": {
+    "type": "string",
+    "description": "指令列表过滤模式：all-显示所有指令，whitelist-仅显示白名单指令，blacklist-隐藏黑名单指令",
+    "default": "all"
+  },
+  "command_whitelist": {
+    "type": "list",
+    "description": "白名单模式下，只显示这些指令",
+    "default": []
+  },
+  "command_blacklist": {
+    "type": "list",
+    "description": "黑名单模式下，隐藏这些指令",
+    "default": []
+  },
+  "custom_descriptions": {
+    "type": "object",
+    "description": "覆盖特定指令的描述信息，格式：{\"指令名\": \"自定义描述\"}",
+    "default": {}
+  },
+  "custom_commands": {
+    "type": "list",
+    "description": "添加自定义指令信息（仅展示，不会真正注册指令）",
+    "default": []
+  },
+  "hide_plugin_info": {
+    "type": "bool",
+    "description": "在指令列表中隐藏指令所属的插件名称",
+    "default": false
+  },
+  "show_wake_prefix_in_list": {
+    "type": "bool",
+    "description": "在指令列表中显示完整的唤醒词前缀",
+    "default": true
+  },
+  "enable_tool_logging": {
+    "type": "bool",
+    "description": "是否记录 LLM Tool 的调用和响应事件",
+    "default": true
+  },
+  "log_level": {
+    "type": "string",
+    "description": "工具调用日志的输出级别（info 或 debug）",
+    "default": "info"
+  }
+}
