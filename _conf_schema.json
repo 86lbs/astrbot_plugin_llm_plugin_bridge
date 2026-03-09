@@ -25,7 +25,7 @@
     "list_mode": {
       "type": "string",
       "title": "指令列表模式",
-      "description": "指令列表过滤模式： whitelist-白名单模式（只显示白名单中的指令), blacklist-黑名单模式(隐藏黑名单中的指令), all-显示所有指令",
+      "description": "指令列表过滤模式：whitelist-白名单模式（只显示白名单中的指令），blacklist-黑名单模式（隐藏黑名单中的指令），all-显示所有指令",
       "enum": ["all", "whitelist", "blacklist"],
       "default": "all"
     },
@@ -62,7 +62,7 @@
         "properties": {
           "name": {
             "type": "string",
-            "title": "指令名称"
+            "title": "指令名称",
             "default": ""
           },
           "description": {

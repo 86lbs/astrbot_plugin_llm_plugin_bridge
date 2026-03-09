@@ -1,6 +1,5 @@
 name: llm_plugin_bridge
 author: Z.ai
-description: LLM 插件桥 - 让 LLM 能够发现、了解和执行 AstrBot 插件指令，整合了插件感知和指令桥接功能
-version: 1.0.1
+description: LLM 插件桥 - 让 LLM 能够发现、了解和执行 AstrBot 插件指令，version: 1.0.2
 repo: https://github.com/your-username/llm_plugin_bridge
 astrbot_version: ">=4.0.0"
