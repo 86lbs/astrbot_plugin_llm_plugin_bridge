@@ -14,6 +14,7 @@ LLM Plugin Bridge - LLM 插件桥
 4. 记录工具调用历史，便于调试和审计
 """
 
+import inspect
 import json
 from typing import Any
 
@@ -664,8 +665,19 @@ class Main(star.Star):
             # 设置解析后的参数到 event
             event.set_extra("parsed_params", parsed_params)
 
-            # 调用处理器
-            result = await handler(event, **parsed_params)
+            # 调用处理器（需要处理不同类型的返回值）
+            result = handler(event, **parsed_params)
+
+            # 检查是否是异步生成器
+            if inspect.isasyncgen(result):
+                # 异步生成器，需要迭代
+                last_item = None
+                async for item in result:
+                    last_item = item
+                result = last_item
+            elif inspect.iscoroutine(result):
+                # 协程，需要 await
+                result = await result
 
             # 处理返回结果
             if result is not None:
