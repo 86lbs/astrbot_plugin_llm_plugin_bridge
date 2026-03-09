@@ -34,10 +34,6 @@ class Main(star.Star):
         self._plugins_cache: dict[str, dict] = {}
         self._wake_prefix: str = ""
 
-        # ========== 消息记录 ==========
-        # 保存最近的原始消息（包含唤醒词），key 为 session_id
-        self._recent_original_messages: dict[str, dict] = {}
-
         # ========== 调用记录 ==========
         self._recent_command_invocations: list[dict] = []
         self._recent_llm_tool_calls: list[dict] = []
@@ -267,35 +263,43 @@ class Main(star.Star):
 
         return examples
 
-    def _save_original_message(self, session_id: str, original_message: str, processed_message: str, sender_id: str):
-        """保存原始消息（包含唤醒词）"""
-        self._recent_original_messages[session_id] = {
-            "original_message": original_message,
-            "processed_message": processed_message,
-            "sender_id": sender_id,
-            "timestamp": time.time(),
-        }
+    def _get_raw_message(self, event: AstrMessageEvent) -> str:
+        """获取原始消息（包含唤醒词）"""
+        # 尝试从 message_obj.raw_message 获取
+        if hasattr(event, 'message_obj') and event.message_obj:
+            raw_msg = getattr(event.message_obj, 'raw_message', None)
+            if raw_msg:
+                # raw_message 可能是不同类型，尝试转换
+                if isinstance(raw_msg, str):
+                    return raw_msg
+                elif isinstance(raw_msg, dict):
+                    # 可能是 OneBot 的消息格式
+                    if 'raw_message' in raw_msg:
+                        return raw_msg['raw_message']
+                    elif 'message' in raw_msg:
+                        msg = raw_msg['message']
+                        if isinstance(msg, str):
+                            return msg
+                        elif isinstance(msg, list):
+                            # 消息链格式
+                            texts = []
+                            for item in msg:
+                                if isinstance(item, dict) and item.get('type') == 'text':
+                                    texts.append(item.get('data', {}).get('text', ''))
+                                elif isinstance(item, str):
+                                    texts.append(item)
+                            return ''.join(texts)
+                elif hasattr(raw_msg, '__str__'):
+                    return str(raw_msg)
         
-        # 清理过期记录
-        current_time = time.time()
-        expired_keys = [
-            k for k, v in self._recent_original_messages.items()
-            if current_time - v["timestamp"] > 300
-        ]
-        for k in expired_keys:
-            del self._recent_original_messages[k]
+        # 尝试从 message_obj.message_str 获取
+        if hasattr(event, 'message_obj') and event.message_obj:
+            msg_str = getattr(event.message_obj, 'message_str', None)
+            if msg_str:
+                return msg_str
         
-        if len(self._recent_original_messages) > 100:
-            sorted_keys = sorted(
-                self._recent_original_messages.keys(),
-                key=lambda k: self._recent_original_messages[k]["timestamp"]
-            )
-            for k in sorted_keys[:len(self._recent_original_messages) - 80]:
-                del self._recent_original_messages[k]
-
-    def _get_original_message(self, session_id: str) -> dict | None:
-        """获取原始消息"""
-        return self._recent_original_messages.get(session_id)
+        # 最后使用 event.message_str
+        return event.message_str or ""
 
     def _add_command_invocation(self, command_name: str, args: str, sender_id: str, message_str: str):
         invocation = {
@@ -367,57 +371,35 @@ class Main(star.Star):
         self._log("[LLM Tool] get_wake_info 被调用")
         self._refresh_wake_prefix()
 
-        session_id = event.session_id
-        original_msg_info = self._get_original_message(session_id)
+        # 获取原始消息
+        raw_message = self._get_raw_message(event)
         llm_received_message = event.message_str or ""
 
         result = {
             "wake_prefix": self._wake_prefix if self._wake_prefix else None,
             "current_session": {
-                "session_id": session_id,
+                "session_id": event.session_id,
+                "original_message": raw_message,
                 "llm_received_message": llm_received_message,
+                "message_was_modified": raw_message != llm_received_message,
             },
         }
 
-        if original_msg_info:
-            result["current_session"]["original_message"] = original_msg_info["original_message"]
-            result["current_session"]["message_was_modified"] = (
-                original_msg_info["original_message"] != original_msg_info["processed_message"]
-            )
+        # 分析用户意图
+        wake = self._wake_prefix or ""
+        
+        if wake and raw_message.startswith(wake):
+            after_wake = raw_message[len(wake):]
             
-            original = original_msg_info["original_message"]
-            wake = self._wake_prefix or ""
-            
+            # 检查是否匹配已知指令
             is_command = False
             command_name = None
             
-            if wake and original.startswith(wake):
-                after_wake = original[len(wake):].strip()
-                
-                for cmd_name in self._commands_cache.keys():
-                    if after_wake.startswith(cmd_name) or after_wake == cmd_name:
-                        is_command = True
-                        command_name = cmd_name
-                        break
-                
-                if not is_command:
-                    result["current_session"]["analysis"] = {
-                        "is_known_command": False,
-                        "possible_intent": "用户可能是在问问题或进行普通对话，而不是执行指令",
-                        "wake_prefix_detected": True,
-                        "content_after_wake": after_wake,
-                    }
-                    
-                    if after_wake and not after_wake.startswith(" "):
-                        result["current_session"]["analysis"]["note"] = (
-                            f"唤醒词「{wake}」后面没有空格，可能是用户在提及包含唤醒词的词汇"
-                            f"（如「{wake}14」），而不是在触发机器人。"
-                        )
-            else:
-                result["current_session"]["analysis"] = {
-                    "is_known_command": False,
-                    "possible_intent": "消息不以唤醒词开头，可能是 @机器人 或私聊触发",
-                }
+            for cmd_name in self._commands_cache.keys():
+                if after_wake.startswith(cmd_name) or after_wake.strip() == cmd_name:
+                    is_command = True
+                    command_name = cmd_name
+                    break
             
             if is_command:
                 result["current_session"]["analysis"] = {
@@ -425,11 +407,26 @@ class Main(star.Star):
                     "command_name": command_name,
                     "possible_intent": f"用户想执行「{command_name}」指令",
                 }
+            else:
+                result["current_session"]["analysis"] = {
+                    "is_known_command": False,
+                    "possible_intent": "用户可能是在问问题或进行普通对话，而不是执行指令",
+                    "content_after_wake": after_wake,
+                }
+                
+                # 检查唤醒词后面是否有空格
+                if after_wake and not after_wake.startswith(" "):
+                    result["current_session"]["analysis"]["note"] = (
+                        f"唤醒词「{wake}」后面没有空格，可能是用户在提及包含唤醒词的词汇"
+                        f"（如「{wake}14」），而不是在触发机器人。"
+                    )
         else:
-            result["current_session"]["original_message"] = llm_received_message
-            result["current_session"]["message_was_modified"] = False
-            result["current_session"]["note"] = "未找到原始消息记录"
+            result["current_session"]["analysis"] = {
+                "is_known_command": False,
+                "possible_intent": "消息不以唤醒词开头，可能是 @机器人 或私聊触发",
+            }
 
+        # 添加判断建议
         result["intent_judgment_guide"] = {
             "how_to_judge": [
                 "1. 比较 original_message 和 llm_received_message，判断消息是否被修改",
@@ -726,27 +723,6 @@ class Main(star.Star):
         """监听 LLM Tool 响应事件"""
         pass
 
-    @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent, request: Any):
-        """监听 LLM 请求事件 - 保存原始消息"""
-        # 在 LLM 请求时保存原始消息
-        original_message = event.message_str or ""
-        
-        # 尝试重建原始消息（如果唤醒词已被去掉）
-        if self._wake_prefix and event.message_str:
-            message_words = event.message_str.split()
-            if message_words:
-                first_word = message_words[0]
-                if first_word in self._commands_cache:
-                    original_message = self._wake_prefix + event.message_str
-        
-        self._save_original_message(
-            session_id=event.session_id,
-            original_message=original_message,
-            processed_message=event.message_str or "",
-            sender_id=event.get_sender_id(),
-        )
-
     # ==================== 用户指令 ====================
 
     @filter.command("lpb_config", alias={"插件桥配置"})
@@ -762,7 +738,6 @@ class Main(star.Star):
         lines.append(f"  指令数量: {len(self._commands_cache)}")
         lines.append(f"  插件数量: {len(self._plugins_cache)}")
         lines.append(f"  唤醒词: {self._get_wake_prefix_display()}")
-        lines.append(f"  原始消息记录: {len(self._recent_original_messages)} 条")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
