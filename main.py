@@ -472,25 +472,11 @@ class Main(star.Star):
                     "possible_intent": "用户可能是在问问题或进行普通对话，而不是执行指令",
                     "content_after_wake": after_wake,
                 }
-                
-                if after_wake and not after_wake.startswith(" "):
-                    result["analysis"]["note"] = (
-                        f"唤醒词「{wake}」后面没有空格，可能是用户在提及包含唤醒词的词汇"
-                        f"（如「{wake}14」），而不是在触发机器人。"
-                    )
         else:
             result["analysis"] = {
                 "is_known_command": False,
                 "possible_intent": "消息不以唤醒词开头",
             }
-            
-            if not wake:
-                result["analysis"]["note"] = "未配置唤醒词，可能是 @机器人 或私聊触发"
-            else:
-                for cmd_name in self._commands_cache.keys():
-                    if llm_received_message.strip().startswith(cmd_name):
-                        result["analysis"]["possible_intent"] = f"消息以指令名「{cmd_name}」开头，但原始消息不包含唤醒词"
-                        break
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
