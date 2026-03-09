@@ -35,9 +35,7 @@ class Main(star.Star):
         self._wake_prefix: str = ""
 
         # ========== 消息历史记录 ==========
-        # key: session_id, value: list of message records
         self._message_history: dict[str, list[dict]] = {}
-        # 每个会话保留的最大消息数
         self._max_history_per_session = 20
 
         # ========== 调用记录 ==========
@@ -316,11 +314,9 @@ class Main(star.Star):
         
         self._message_history[session_id].append(record)
         
-        # 保持历史记录在限制内
         if len(self._message_history[session_id]) > self._max_history_per_session:
             self._message_history[session_id] = self._message_history[session_id][-self._max_history_per_session:]
         
-        # 清理过期的会话记录（30分钟无活动）
         current_time = time.time()
         expired_sessions = [
             sid for sid, records in self._message_history.items()
@@ -423,7 +419,6 @@ class Main(star.Star):
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name()
 
-        # 保存当前消息到历史
         self._save_message_history(session_id, raw_message, llm_received_message, sender_id, sender_name)
 
         result = {
@@ -447,7 +442,7 @@ class Main(star.Star):
                     "sender_name": h["sender_name"],
                     "time_ago": f"{int(time.time() - h['timestamp'])}秒前",
                 }
-                for h in history[:-1]  # 不包括当前消息
+                for h in history[:-1]
             ]
 
         # 分析用户意图
@@ -456,7 +451,6 @@ class Main(star.Star):
         if wake and raw_message.startswith(wake):
             after_wake = raw_message[len(wake):]
             
-            # 检查是否匹配已知指令
             is_command = False
             command_name = None
             
@@ -471,7 +465,6 @@ class Main(star.Star):
                     "is_known_command": True,
                     "command_name": command_name,
                     "possible_intent": f"用户想执行「{command_name}」指令",
-                    "recommendation": "这是明确的指令调用，可以执行或使用 execute_command 工具",
                 }
             else:
                 result["analysis"] = {
@@ -480,15 +473,12 @@ class Main(star.Star):
                     "content_after_wake": after_wake,
                 }
                 
-                # 检查唤醒词后面是否有空格
                 if after_wake and not after_wake.startswith(" "):
                     result["analysis"]["note"] = (
                         f"唤醒词「{wake}」后面没有空格，可能是用户在提及包含唤醒词的词汇"
                         f"（如「{wake}14」），而不是在触发机器人。"
                     )
-                    result["analysis"]["recommendation"] = "这很可能是误触发，用户不是在执行指令，请正常对话回答用户问题"
         else:
-            # 消息不以唤醒词开头
             result["analysis"] = {
                 "is_known_command": False,
                 "possible_intent": "消息不以唤醒词开头",
@@ -497,11 +487,9 @@ class Main(star.Star):
             if not wake:
                 result["analysis"]["note"] = "未配置唤醒词，可能是 @机器人 或私聊触发"
             else:
-                # 检查是否是已知指令名开头
                 for cmd_name in self._commands_cache.keys():
                     if llm_received_message.strip().startswith(cmd_name):
                         result["analysis"]["possible_intent"] = f"消息以指令名「{cmd_name}」开头，但原始消息不包含唤醒词"
-                        result["analysis"]["recommendation"] = "用户可能是在提及指令名而不是执行指令，请根据上下文判断"
                         break
 
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -702,7 +690,6 @@ class Main(star.Star):
         """
         self._log(f"[LLM Tool] execute_command 被调用")
 
-        # 检查用户意图
         intent = self._check_user_intent(event.get_sender_id(), event.message_str or "")
         if intent["should_skip_llm_execution"]:
             return f"跳过执行：{intent['reason']}"
