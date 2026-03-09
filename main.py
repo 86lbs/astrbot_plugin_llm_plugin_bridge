@@ -4,14 +4,8 @@ LLM Plugin Bridge - LLM 插件桥
 整合 LLM 与 AstrBot 插件系统的桥梁，让 LLM 能够：
 - 发现和了解所有可用的插件和指令
 - 获取唤醒词和触发方式信息
+- 获取原始消息（包含唤醒词），判断用户意图
 - 执行插件指令（可配置权限控制）
-- 判断用户意图，避免重复执行
-
-功能特性：
-1. 提供 LLM Tool 查询指令和插件信息
-2. 提供 LLM Tool 执行插件指令
-3. 支持指令黑白名单等高级配置
-4. 监听指令调用，帮助 LLM 判断用户意图
 """
 
 import inspect
@@ -39,6 +33,10 @@ class Main(star.Star):
         self._commands_cache: dict[str, dict] = {}
         self._plugins_cache: dict[str, dict] = {}
         self._wake_prefix: str = ""
+
+        # ========== 消息记录 ==========
+        # 保存最近的原始消息（包含唤醒词），key 为 session_id
+        self._recent_original_messages: dict[str, dict] = {}
 
         # ========== 调用记录 ==========
         self._recent_command_invocations: list[dict] = []
@@ -77,7 +75,6 @@ class Main(star.Star):
         logger.info(f"  - LLM 执行功能: {'已启用' if self._allow_execute else '已禁用'}")
 
     def _log(self, message: str, level: str = "info"):
-        """根据配置的日志级别输出日志"""
         if self._log_level == "debug" or level == "info":
             logger.info(message)
         elif level == "debug":
@@ -86,13 +83,11 @@ class Main(star.Star):
     # ==================== 缓存管理 ====================
 
     def _refresh_all_cache(self) -> None:
-        """刷新所有缓存"""
         self._refresh_wake_prefix()
         self._refresh_commands_cache()
         self._refresh_plugins_cache()
 
     def _refresh_wake_prefix(self) -> None:
-        """刷新唤醒词配置"""
         try:
             cfg = self.context.get_config()
             if cfg:
@@ -103,7 +98,6 @@ class Main(star.Star):
             self._wake_prefix = ""
 
     def _refresh_commands_cache(self) -> None:
-        """刷新指令缓存"""
         self._commands_cache.clear()
 
         handlers = star_handlers_registry.get_handlers_by_event_type(
@@ -197,7 +191,6 @@ class Main(star.Star):
             }
 
     def _refresh_plugins_cache(self) -> None:
-        """刷新插件缓存"""
         self._plugins_cache.clear()
         
         all_stars = self.context.get_all_stars()
@@ -274,8 +267,38 @@ class Main(star.Star):
 
         return examples
 
+    def _save_original_message(self, session_id: str, original_message: str, processed_message: str, sender_id: str):
+        """保存原始消息（包含唤醒词）"""
+        self._recent_original_messages[session_id] = {
+            "original_message": original_message,  # 用户发送的原始消息（包含唤醒词）
+            "processed_message": processed_message,  # 处理后的消息（去掉唤醒词）
+            "sender_id": sender_id,
+            "timestamp": time.time(),
+        }
+        
+        # 清理过期记录（保留最近 100 条，5 分钟内）
+        current_time = time.time()
+        expired_keys = [
+            k for k, v in self._recent_original_messages.items()
+            if current_time - v["timestamp"] > 300  # 5 分钟
+        ]
+        for k in expired_keys:
+            del self._recent_original_messages[k]
+        
+        # 如果超过 100 条，删除最旧的
+        if len(self._recent_original_messages) > 100:
+            sorted_keys = sorted(
+                self._recent_original_messages.keys(),
+                key=lambda k: self._recent_original_messages[k]["timestamp"]
+            )
+            for k in sorted_keys[:len(self._recent_original_messages) - 80]:
+                del self._recent_original_messages[k]
+
+    def _get_original_message(self, session_id: str) -> dict | None:
+        """获取原始消息"""
+        return self._recent_original_messages.get(session_id)
+
     def _add_command_invocation(self, command_name: str, args: str, sender_id: str, message_str: str):
-        """记录指令调用（用户通过唤醒词+指令触发）"""
         invocation = {
             "command": command_name,
             "args": args,
@@ -291,7 +314,6 @@ class Main(star.Star):
         self._log(f"[Command Invocation] 用户执行指令: {command_name} {args}")
 
     def _add_llm_tool_call(self, tool_name: str, tool_args: dict | None, sender_id: str):
-        """记录 LLM 工具调用"""
         call = {
             "tool": tool_name,
             "args": tool_args,
@@ -306,7 +328,6 @@ class Main(star.Star):
         self._log(f"[LLM Tool Call] 工具 '{tool_name}' 被调用")
 
     def _check_user_intent(self, sender_id: str, message_str: str, time_window: float = 5.0) -> dict:
-        """检查用户意图：判断用户是否已经通过指令方式触发了功能"""
         current_time = time.time()
         
         for invocation in reversed(self._recent_command_invocations):
@@ -334,15 +355,126 @@ class Main(star.Star):
 
     # ==================== LLM 工具 ====================
 
-    @filter.llm_tool(name="check_user_intent")
-    async def check_user_intent(self, event: AstrMessageEvent) -> str:
-        """检查用户意图，判断用户是否已经通过指令方式触发了功能。在执行任何可能重复的操作之前调用此工具。
+    @filter.llm_tool(name="get_wake_info")
+    async def get_wake_info(self, event: AstrMessageEvent) -> str:
+        """获取机器人的唤醒信息和当前消息的原始内容。当 LLM 需要判断用户意图、确认是否被误触发时调用此工具。
 
         返回信息包括：
-        - 用户是否已通过指令触发
-        - 触发的指令信息
-        - LLM 是否应该跳过执行
+        - 唤醒词配置
+        - 用户发送的原始消息（包含唤醒词）
+        - LLM 收到的消息（去掉唤醒词后）
+        - 用户意图判断建议
         """
+        self._log("[LLM Tool] get_wake_info 被调用")
+        self._refresh_wake_prefix()
+
+        # 获取当前会话的原始消息
+        session_id = event.session_id
+        original_msg_info = self._get_original_message(session_id)
+        
+        # LLM 收到的消息
+        llm_received_message = event.message_str or ""
+
+        result = {
+            "wake_prefix": self._wake_prefix if self._wake_prefix else None,
+            "current_session": {
+                "session_id": session_id,
+                "llm_received_message": llm_received_message,
+            },
+        }
+
+        # 如果有原始消息记录
+        if original_msg_info:
+            result["current_session"]["original_message"] = original_msg_info["original_message"]
+            result["current_session"]["message_was_modified"] = (
+                original_msg_info["original_message"] != original_msg_info["processed_message"]
+            )
+            
+            # 分析用户意图
+            original = original_msg_info["original_message"]
+            wake = self._wake_prefix or ""
+            
+            # 判断是否是指令
+            is_command = False
+            command_name = None
+            
+            if wake and original.startswith(wake):
+                # 去掉唤醒词后的内容
+                after_wake = original[len(wake):].strip()
+                
+                # 检查是否匹配已知指令
+                for cmd_name in self._commands_cache.keys():
+                    if after_wake.startswith(cmd_name) or after_wake == cmd_name:
+                        is_command = True
+                        command_name = cmd_name
+                        break
+                
+                # 如果不是已知指令，分析可能的情况
+                if not is_command:
+                    # 检查是否是唤醒词+其他内容（非指令）
+                    result["current_session"]["analysis"] = {
+                        "is_known_command": False,
+                        "possible_intent": "用户可能是在问问题或进行普通对话，而不是执行指令",
+                        "wake_prefix_detected": True,
+                        "content_after_wake": after_wake,
+                    }
+                    
+                    # 特殊情况：唤醒词可能是某个词的一部分
+                    # 例如 "nova14怎么样？" 中 "nova" 是 "nova14" 的一部分
+                    if after_wake and not after_wake.startswith(" "):
+                        result["current_session"]["analysis"]["note"] = (
+                            f"唤醒词「{wake}」后面没有空格，可能是用户在提及包含唤醒词的词汇"
+                            f"（如「{wake}14」），而不是在触发机器人。"
+                        )
+            else:
+                result["current_session"]["analysis"] = {
+                    "is_known_command": False,
+                    "possible_intent": "消息不以唤醒词开头，可能是 @机器人 或私聊触发",
+                }
+            
+            if is_command:
+                result["current_session"]["analysis"] = {
+                    "is_known_command": True,
+                    "command_name": command_name,
+                    "possible_intent": f"用户想执行「{command_name}」指令",
+                }
+        else:
+            result["current_session"]["original_message"] = llm_received_message
+            result["current_session"]["message_was_modified"] = False
+            result["current_session"]["note"] = "未找到原始消息记录，可能消息未被处理过"
+
+        # 添加判断建议
+        result["intent_judgment_guide"] = {
+            "how_to_judge": [
+                "1. 比较 original_message 和 llm_received_message，判断消息是否被修改",
+                "2. 如果唤醒词后面是已知指令名，用户可能在执行指令",
+                "3. 如果唤醒词后面不是指令名，用户可能在普通对话",
+                "4. 如果唤醒词后面没有空格，可能是用户在提及包含唤醒词的词汇",
+            ],
+            "examples": [
+                {
+                    "original": f"{self._wake_prefix}天气 北京" if self._wake_prefix else "/天气 北京",
+                    "llm_receives": "天气 北京",
+                    "intent": "执行天气指令",
+                },
+                {
+                    "original": f"{self._wake_prefix}14怎么样？" if self._wake_prefix else "14怎么样？",
+                    "llm_receives": "14怎么样？",
+                    "intent": f"用户在问「{self._wake_prefix}14」相关问题，不是执行指令" if self._wake_prefix else "普通对话",
+                },
+                {
+                    "original": f"{self._wake_prefix} 你好" if self._wake_prefix else "你好",
+                    "llm_receives": "你好",
+                    "intent": "普通对话",
+                },
+            ],
+        }
+
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @filter.llm_tool(name="check_user_intent")
+    async def check_user_intent(self, event: AstrMessageEvent) -> str:
+        """检查用户意图，判断用户是否已经通过指令方式触发了功能。在执行任何可能重复的操作之前调用此工具。"""
         self._log("[LLM Tool] check_user_intent 被调用")
         
         sender_id = event.get_sender_id()
@@ -350,83 +482,6 @@ class Main(star.Star):
         
         result = self._check_user_intent(sender_id, message_str)
         
-        return json.dumps(result, ensure_ascii=False, indent=2)
-
-    @filter.llm_tool(name="get_wake_info")
-    async def get_wake_info(self, event: AstrMessageEvent) -> str:
-        """获取机器人的唤醒信息。当 LLM 需要了解唤醒词、判断用户意图时调用此工具。
-
-        重要说明：
-        - 唤醒词会被 AstrBot 自动去掉，LLM 收到的消息是去掉唤醒词后的内容
-        - 例如：唤醒词为 "nova"，用户发送 "nova天气 北京"，LLM 收到的是 "天气 北京"
-        - LLM 需要根据这个信息判断用户是在执行指令还是在普通对话
-        """
-        self._log("[LLM Tool] get_wake_info 被调用")
-        self._refresh_wake_prefix()
-
-        result = {
-            "wake_prefix": self._wake_prefix if self._wake_prefix else None,
-            "trigger_methods": [],
-            "command_format": "",
-            "examples": [],
-        }
-
-        if self._wake_prefix:
-            result["trigger_methods"].append(
-                f"发送「{self._wake_prefix}」开头的消息"
-            )
-            result["command_format"] = f"{self._wake_prefix}指令名 [参数]"
-            result["examples"] = [
-                f"{self._wake_prefix}help - 获取帮助",
-                f"{self._wake_prefix}天气 北京 - 查询北京天气",
-            ]
-            
-            # 关键信息：唤醒词会被去掉
-            result["important_note"] = (
-                f"唤醒词「{self._wake_prefix}」会被系统自动去掉。"
-                f"你收到的消息是去掉唤醒词后的内容。"
-            )
-            result["message_processing_examples"] = [
-                {
-                    "user_sent": f"{self._wake_prefix}天气 北京",
-                    "llm_receives": "天气 北京",
-                    "is_command": True,
-                    "meaning": "用户想执行天气指令",
-                },
-                {
-                    "user_sent": f"{self._wake_prefix}14怎么样？",
-                    "llm_receives": "14怎么样？",
-                    "is_command": False,
-                    "meaning": f"用户可能是在问关于「{self._wake_prefix}14」的问题，不是执行指令",
-                },
-                {
-                    "user_sent": f"{self._wake_prefix}help",
-                    "llm_receives": "help",
-                    "is_command": True,
-                    "meaning": "用户想执行 help 指令",
-                },
-            ]
-            result["how_to_judge_intent"] = (
-                f"判断用户意图的方法："
-                f"1. 如果你收到的消息开头是指令名（如「天气」「help」），用户可能在执行指令"
-                f"2. 如果消息开头不是已知指令名，用户可能是在普通对话"
-                f"3. 使用 check_user_intent 工具可以确认用户是否已通过指令触发"
-                f"4. 使用 list_commands 工具可以查看所有可用指令"
-            )
-        else:
-            result["trigger_methods"].extend([
-                "@机器人 后发送消息",
-                "私聊直接发送消息",
-                "群聊中使用 / 开头的指令",
-            ])
-            result["command_format"] = "/指令名 [参数] 或 @机器人 指令名 [参数]"
-            result["examples"] = [
-                "/help - 获取帮助",
-                "/天气 北京 - 查询北京天气",
-                "@机器人 帮助 - @机器人后发送帮助",
-            ]
-            result["important_note"] = "未配置唤醒词，消息内容不会被修改。"
-
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="list_commands")
@@ -440,11 +495,11 @@ class Main(star.Star):
         """列出所有可用的插件指令。当用户想知道机器人能做什么、有哪些指令可用时调用此工具。
 
         Args:
-            keyword(string): 可选的关键词，用于过滤指令名称或描述中包含该关键词的指令。留空则列出所有指令。
-            plugin_name(string): 可选的插件名称，用于过滤特定插件的指令。留空则列出所有插件的指令。
-            include_params(boolean): 是否包含参数信息。默认为 False，仅显示指令名称和描述。
+            keyword(string): 可选的关键词，用于过滤指令名称或描述中包含该关键词的指令。
+            plugin_name(string): 可选的插件名称，用于过滤特定插件的指令。
+            include_params(boolean): 是否包含参数信息。
         """
-        self._log(f"[LLM Tool] list_commands 被调用, keyword={keyword}, plugin_name={plugin_name}")
+        self._log(f"[LLM Tool] list_commands 被调用, keyword={keyword}")
         self._refresh_commands_cache()
         self._refresh_wake_prefix()
 
@@ -455,10 +510,9 @@ class Main(star.Star):
 
             if plugin_name:
                 cmd_plugin = cmd_info.get("plugin", {})
-                if cmd_plugin:
-                    if cmd_plugin.get("name", "").lower() != plugin_name.lower():
-                        continue
-                else:
+                if cmd_plugin and cmd_plugin.get("name", "").lower() != plugin_name.lower():
+                    continue
+                elif not cmd_plugin:
                     continue
 
             if keyword:
@@ -477,9 +531,7 @@ class Main(star.Star):
             if self._show_wake_prefix_in_list:
                 cmd_entry["full_command"] = f"{self._get_command_prefix()}{cmd_name}"
 
-            aliases = [
-                n for n in cmd_info["names"] if n != cmd_name and not n.startswith(" ")
-            ]
+            aliases = [n for n in cmd_info["names"] if n != cmd_name and not n.startswith(" ")]
             if aliases:
                 cmd_entry["aliases"] = aliases
 
@@ -500,7 +552,7 @@ class Main(star.Star):
             if keyword:
                 return f"没有找到包含关键词「{keyword}」的指令。"
             if plugin_name:
-                return f"没有找到插件「{plugin_name}」的指令。使用 list_plugins 工具查看所有插件。"
+                return f"没有找到插件「{plugin_name}」的指令。"
             return "当前没有可用的指令。"
 
         result = {
@@ -509,25 +561,20 @@ class Main(star.Star):
         }
 
         if self._show_wake_prefix_in_list:
-            result["wake_prefix"] = self._wake_prefix if self._wake_prefix else "无（使用 / 或 @机器人）"
+            result["wake_prefix"] = self._wake_prefix if self._wake_prefix else "无"
             result["command_prefix"] = self._get_command_prefix()
-
-        result["note"] = "使用 get_command_details 工具可以获取特定指令的详细信息。使用 get_wake_info 工具可以了解如何触发指令。"
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="get_command_details")
-    async def get_command_details(
-        self, event: AstrMessageEvent, command_name: str
-    ) -> str:
-        """获取特定指令的详细信息，包括完整描述、参数说明和使用示例。当用户想了解某个具体指令如何使用时调用此工具。
+    async def get_command_details(self, event: AstrMessageEvent, command_name: str) -> str:
+        """获取特定指令的详细信息。
 
         Args:
-            command_name(string): 指令名称，如 "help"、"天气" 等（不需要带唤醒词前缀）。
+            command_name(string): 指令名称。
         """
         self._log(f"[LLM Tool] get_command_details 被调用, command_name={command_name}")
         self._refresh_commands_cache()
-        self._refresh_wake_prefix()
 
         cmd_info = None
         for name, info in self._commands_cache.items():
@@ -536,49 +583,27 @@ class Main(star.Star):
                 break
 
         if not cmd_info:
-            similar = [
-                name
-                for name in self._commands_cache.keys()
-                if command_name.lower() in name.lower()
-            ]
+            similar = [name for name in self._commands_cache.keys() if command_name.lower() in name.lower()]
             if similar:
                 return f"未找到指令「{command_name}」。您是否要找: {', '.join(similar)}？"
-            return f"未找到指令「{command_name}」。使用 list_commands 工具查看所有可用指令。"
+            return f"未找到指令「{command_name}」。"
 
         result = {
             "name": cmd_info["primary_name"],
             "full_command": f"{self._get_command_prefix()}{cmd_info['primary_name']}",
-            "wake_prefix": self._wake_prefix if self._wake_prefix else "无",
-            "aliases": [
-                n
-                for n in cmd_info["names"]
-                if n != cmd_info["primary_name"] and not n.startswith(" ")
-            ],
             "description": cmd_info["description"],
             "params": cmd_info["params"] if cmd_info["params"] else None,
+            "usage_examples": self._generate_usage_examples(cmd_info),
         }
 
         if cmd_info["plugin"] and not self._hide_plugin_info:
-            result["plugin"] = cmd_info["plugin"]
-
-        if cmd_info["is_custom"] and cmd_info.get("example"):
-            result["usage_examples"] = [cmd_info["example"]]
-        else:
-            result["usage_examples"] = self._generate_usage_examples(cmd_info)
-
-        if cmd_info["is_custom"]:
-            result["is_custom"] = True
-            result["note"] = "这是一个自定义指令，仅用于展示，无法通过 execute_command 执行。"
-        else:
-            result["executable"] = self._is_command_executable(cmd_info["primary_name"])
-            if not result["executable"]:
-                result["note"] = "此指令已被管理员禁止通过 LLM 执行。"
+            result["plugin"] = cmd_info["plugin"]["name"]
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="list_plugins")
     async def list_plugins(self, event: AstrMessageEvent) -> str:
-        """列出所有已加载的插件。当用户想知道有哪些插件、想了解插件概况时调用此工具。"""
+        """列出所有已加载的插件。"""
         self._log("[LLM Tool] list_plugins 被调用")
         self._refresh_plugins_cache()
 
@@ -587,29 +612,22 @@ class Main(star.Star):
 
         plugins = []
         for plugin_name, plugin_info in self._plugins_cache.items():
-            plugin_entry = {
+            plugins.append({
                 "name": plugin_info["name"],
                 "author": plugin_info.get("author", "未知"),
                 "version": plugin_info.get("version", "未知"),
                 "description": plugin_info.get("desc", ""),
                 "activated": plugin_info.get("activated", False),
-            }
-            plugins.append(plugin_entry)
+            })
 
-        result = {
-            "total": len(plugins),
-            "plugins": plugins,
-            "note": "使用 get_plugin_info 工具可以获取特定插件的详细信息，包括它注册的指令。"
-        }
-
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return json.dumps({"total": len(plugins), "plugins": plugins}, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="get_plugin_info")
     async def get_plugin_info_tool(self, event: AstrMessageEvent, plugin_name: str) -> str:
-        """获取特定插件的详细信息，包括它注册的所有指令。当用户想深入了解某个插件的功能时调用此工具。
+        """获取特定插件的详细信息。
 
         Args:
-            plugin_name(string): 插件名称，如 "web_searcher"、"astrbot" 等。
+            plugin_name(string): 插件名称。
         """
         self._log(f"[LLM Tool] get_plugin_info 被调用, plugin_name={plugin_name}")
         self._refresh_plugins_cache()
@@ -622,24 +640,12 @@ class Main(star.Star):
                 break
 
         if not plugin_info:
-            similar = [
-                name for name in self._plugins_cache.keys()
-                if plugin_name.lower() in name.lower()
-            ]
-            if similar:
-                return f"未找到插件「{plugin_name}」。您是否要找: {', '.join(similar)}？"
-            return f"未找到插件「{plugin_name}」。使用 list_plugins 工具查看所有可用插件。"
+            return f"未找到插件「{plugin_name}」。"
 
         plugin_commands = []
         for cmd_name, cmd_info in self._commands_cache.items():
             if cmd_info.get("plugin", {}).get("name", "").lower() == plugin_info["name"].lower():
-                cmd_entry = {
-                    "name": cmd_name,
-                    "description": cmd_info["description"],
-                }
-                if cmd_info["params"]:
-                    cmd_entry["has_params"] = True
-                plugin_commands.append(cmd_entry)
+                plugin_commands.append({"name": cmd_name, "description": cmd_info["description"]})
 
         result = {
             "name": plugin_info["name"],
@@ -647,38 +653,23 @@ class Main(star.Star):
             "version": plugin_info.get("version", "未知"),
             "description": plugin_info.get("desc", ""),
             "activated": plugin_info.get("activated", False),
-            "repo": plugin_info.get("repo", ""),
-            "commands_count": len(plugin_commands),
-            "commands": plugin_commands[:10] if plugin_commands else [],
+            "commands": plugin_commands[:10],
         }
-
-        if len(plugin_commands) > 10:
-            result["note"] = f"该插件注册了 {len(plugin_commands)} 个指令，此处仅显示前10个。"
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="execute_command")
-    async def execute_command(
-        self,
-        event: AstrMessageEvent,
-        command_name: str,
-        args: str = "",
-    ) -> str:
-        """执行指定的插件指令。当用户明确要求执行某个指令，或者 LLM 认为需要通过执行指令来完成任务时调用此工具。
-
-        重要：在执行之前，请先调用 check_user_intent 工具检查用户是否已经通过指令方式触发了该功能。
+    async def execute_command(self, event: AstrMessageEvent, command_name: str, args: str = "") -> str:
+        """执行指定的插件指令。
 
         Args:
-            command_name(string): 要执行的指令名称（不需要带唤醒词前缀）。
-            args(string): 指令参数，多个参数用空格分隔。如 "北京 天气" 表示两个参数。
+            command_name(string): 要执行的指令名称。
+            args(string): 指令参数。
         """
-        self._log(f"[LLM Tool] execute_command 被调用, command_name={command_name}, args={args}")
+        self._log(f"[LLM Tool] execute_command 被调用, command_name={command_name}")
 
         # 检查用户意图
-        sender_id = event.get_sender_id()
-        message_str = event.message_str or ""
-        intent = self._check_user_intent(sender_id, message_str)
-        
+        intent = self._check_user_intent(event.get_sender_id(), event.message_str or "")
         if intent["should_skip_llm_execution"]:
             return f"跳过执行：{intent['reason']}"
 
@@ -700,10 +691,10 @@ class Main(star.Star):
             return f"错误：未找到指令「{command_name}」。"
 
         if cmd_info.get("is_custom"):
-            return "错误：自定义指令无法通过 execute_command 执行。"
+            return "错误：自定义指令无法执行。"
 
         if not self._is_command_executable(command_name):
-            return f"错误：指令「{command_name}」已被禁止通过 LLM 执行。"
+            return f"错误：指令「{command_name}」已被禁止执行。"
 
         try:
             handler_md = cmd_info["handler_md"]
@@ -711,15 +702,11 @@ class Main(star.Star):
 
             args_list = args.split() if args else []
             try:
-                parsed_params = command_filter.validate_and_convert_params(
-                    args_list, command_filter.handler_params
-                )
+                parsed_params = command_filter.validate_and_convert_params(args_list, command_filter.handler_params)
             except ValueError as e:
-                examples = self._generate_usage_examples(cmd_info)
-                return f"参数错误: {str(e)}\n使用示例: {examples[0] if examples else '无'}"
+                return f"参数错误: {str(e)}"
 
             from astrbot.core.star.star import star_map
-
             star_info = star_map.get(handler_md.handler_module_path)
             if not star_info or not star_info.star_cls_type:
                 return "错误：无法获取插件实例。"
@@ -740,26 +727,21 @@ class Main(star.Star):
             if result is not None:
                 if isinstance(result, MessageEventResult):
                     plain_text = result.get_plain_text()
-                    if plain_text:
-                        return f"指令执行成功: {plain_text}"
-                    return "指令执行成功（返回了非文本内容）。"
+                    return f"执行成功: {plain_text}" if plain_text else "执行成功。"
                 elif isinstance(result, str):
-                    return f"指令执行成功: {result}"
-                else:
-                    return "指令执行成功。"
+                    return f"执行成功: {result}"
+                return "执行成功。"
 
             event_result = event.get_result()
             if event_result:
                 plain_text = event_result.get_plain_text()
-                if plain_text:
-                    return f"指令执行结果: {plain_text}"
-                return "指令执行成功。"
+                return f"执行结果: {plain_text}" if plain_text else "执行成功。"
 
-            return "指令已执行，但未返回结果。"
+            return "指令已执行。"
 
         except Exception as e:
             logger.error(f"执行指令时发生错误: {e}", exc_info=True)
-            return f"执行指令时发生错误: {str(e)}"
+            return f"执行错误: {str(e)}"
 
     # ==================== 事件监听 ====================
 
@@ -768,30 +750,60 @@ class Main(star.Star):
         """监听 LLM Tool 调用事件"""
         if not self._enable_tool_logging:
             return
-
-        sender_id = event.get_sender_id()
-        self._add_llm_tool_call(tool.name if tool else "unknown", tool_args, sender_id)
+        self._add_llm_tool_call(tool.name if tool else "unknown", tool_args, event.get_sender_id())
 
     @filter.on_llm_tool_respond()
     async def on_llm_tool_respond(self, event: AstrMessageEvent, tool: FunctionTool, tool_args: dict | None, tool_result: Any):
-        """监听 LLM Tool 响应事件"""
         pass
 
     @filter.on_command_run()
     async def on_command_run(self, event: AstrMessageEvent):
-        """监听指令执行事件 - 记录用户通过指令触发的行为"""
+        """监听指令执行事件"""
         parsed_params = event.get_extra("parsed_params") or {}
         command_name = event.get_extra("command_name") or ""
         
         if command_name:
             args_str = " ".join(str(v) for v in parsed_params.values()) if parsed_params else ""
-            
-            self._add_command_invocation(
-                command_name=command_name,
-                args=args_str,
-                sender_id=event.get_sender_id(),
-                message_str=event.message_str,
-            )
+            self._add_command_invocation(command_name, args_str, event.get_sender_id(), event.message_str)
+
+    @filter.on_all_message()
+    async def on_all_message(self, event: AstrMessageEvent):
+        """监听所有消息，保存原始消息（包含唤醒词）"""
+        # 获取原始消息（包含唤醒词）
+        # 注意：event.message_str 可能已经是处理后的消息
+        # 我们需要从 event 的其他属性获取原始消息
+        
+        original_message = event.message_str or ""
+        
+        # 尝试获取原始消息
+        # AstrBot 可能会在 event 中保存原始消息
+        if hasattr(event, 'raw_message') and event.raw_message:
+            original_message = event.raw_message
+        elif hasattr(event, '_raw_message') and event._raw_message:
+            original_message = event._raw_message
+        elif hasattr(event, 'original_message') and event.original_message:
+            original_message = event.original_message
+        
+        # 如果有唤醒词，尝试重建原始消息
+        if self._wake_prefix and event.message_str:
+            # 检查消息是否以唤醒词开头（已经被去掉的情况）
+            # 如果 LLM 收到的消息不是以唤醒词开头，可能唤醒词已被去掉
+            if not event.message_str.startswith(self._wake_prefix):
+                # 检查是否可能是唤醒词触发的消息
+                # 通过检查消息是否匹配某个指令来判断
+                message_words = event.message_str.split()
+                if message_words:
+                    first_word = message_words[0]
+                    # 如果第一个词是指令名，说明可能是唤醒词+指令
+                    if first_word in self._commands_cache:
+                        original_message = self._wake_prefix + event.message_str
+        
+        self._save_original_message(
+            session_id=event.session_id,
+            original_message=original_message,
+            processed_message=event.message_str or "",
+            sender_id=event.get_sender_id(),
+        )
 
     # ==================== 用户指令 ====================
 
@@ -799,39 +811,16 @@ class Main(star.Star):
     async def show_config(self, event: AstrMessageEvent):
         """显示当前插件配置"""
         lines = ["⚙️ LLM Plugin Bridge 配置信息", ""]
-
         lines.append("【执行配置】")
         lines.append(f"  允许 LLM 执行: {'✅' if self._allow_execute else '❌'}")
         lines.append(f"  执行需管理员权限: {'✅' if self._execute_require_admin else '❌'}")
-        if self._blocked_commands:
-            lines.append(f"  禁止执行的指令: {', '.join(self._blocked_commands)}")
-        else:
-            lines.append("  禁止执行的指令: 无")
+        lines.append(f"  禁止执行的指令: {', '.join(self._blocked_commands) or '无'}")
         lines.append("")
-
-        lines.append("【列表过滤配置】")
-        mode_desc = {
-            "all": "显示所有指令",
-            "whitelist": "仅显示白名单指令",
-            "blacklist": "隐藏黑名单指令",
-        }
-        lines.append(f"  列表模式: {self._list_mode} ({mode_desc.get(self._list_mode, '')})")
-
-        if self._list_mode == "whitelist" and self._command_whitelist:
-            lines.append(f"  白名单指令: {', '.join(self._command_whitelist)}")
-        elif self._list_mode == "blacklist" and self._command_blacklist:
-            lines.append(f"  黑名单指令: {', '.join(self._command_blacklist)}")
-        lines.append("")
-
-        lines.append("【调用记录】")
-        lines.append(f"  最近指令调用: {len(self._recent_command_invocations)} 条")
-        lines.append(f"  最近LLM工具调用: {len(self._recent_llm_tool_calls)} 条")
-        lines.append("")
-
         lines.append("【缓存状态】")
         lines.append(f"  指令数量: {len(self._commands_cache)}")
         lines.append(f"  插件数量: {len(self._plugins_cache)}")
-        lines.append(f"  当前唤醒词: {self._get_wake_prefix_display()}")
+        lines.append(f"  唤醒词: {self._get_wake_prefix_display()}")
+        lines.append(f"  原始消息记录: {len(self._recent_original_messages)} 条")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
@@ -841,77 +830,41 @@ class Main(star.Star):
         self._refresh_all_cache()
         event.set_result(
             MessageEventResult()
-            .message(f"缓存已刷新\n• 指令: {len(self._commands_cache)} 个\n• 插件: {len(self._plugins_cache)} 个\n• 唤醒词: {self._get_wake_prefix_display()}")
+            .message(f"缓存已刷新\n• 指令: {len(self._commands_cache)} 个\n• 插件: {len(self._plugins_cache)} 个")
             .use_t2i(False)
         )
 
     @filter.command("lpb_list", alias={"列出指令"})
     async def list_commands_direct(self, event: AstrMessageEvent):
-        """直接列出所有可用指令"""
+        """列出所有可用指令"""
         self._refresh_commands_cache()
-        self._refresh_wake_prefix()
 
-        visible_commands = {
-            k: v for k, v in self._commands_cache.items()
-            if self._is_command_visible(k)
-        }
-
+        visible_commands = {k: v for k, v in self._commands_cache.items() if self._is_command_visible(k)}
         if not visible_commands:
-            event.set_result(
-                MessageEventResult().message("当前没有可用的指令。").use_t2i(False)
-            )
+            event.set_result(MessageEventResult().message("当前没有可用的指令。").use_t2i(False))
             return
 
         prefix = self._get_command_prefix() if self._show_wake_prefix_in_list else ""
         lines = ["📋 可用指令列表：", ""]
 
-        plugins_commands = {}
         for cmd_name, cmd_info in sorted(visible_commands.items()):
-            pn = cmd_info.get("plugin", {}).get("name", "其他") if cmd_info.get("plugin") else "其他"
-            if pn not in plugins_commands:
-                plugins_commands[pn] = []
-            plugins_commands[pn].append((cmd_name, cmd_info))
+            desc = cmd_info["description"][:30]
+            if len(cmd_info["description"]) > 30:
+                desc += "..."
+            cmd_display = f"{prefix}{cmd_name}" if prefix else cmd_name
+            lines.append(f"  • {cmd_display} - {desc}")
 
-        for pn, cmds in plugins_commands.items():
-            lines.append(f"【{pn}】")
-            for cmd_name, cmd_info in cmds:
-                desc = cmd_info["description"][:30]
-                if len(cmd_info["description"]) > 30:
-                    desc += "..."
-
-                cmd_display = f"{prefix}{cmd_name}" if prefix else cmd_name
-
-                marks = []
-                if cmd_info.get("is_custom"):
-                    marks.append("自定义")
-                elif not self._is_command_executable(cmd_name):
-                    marks.append("禁止执行")
-
-                mark_str = f" [{', '.join(marks)}]" if marks else ""
-                lines.append(f"  • {cmd_display}{mark_str} - {desc}")
-
-            lines.append("")
-
-        lines.append(f"共 {len(visible_commands)} 个指令")
-        lines.append(f"唤醒词: {self._get_wake_prefix_display()}")
-        lines.append("使用 /lpb_info <指令名> 查看详细信息")
-
+        lines.append(f"\n共 {len(visible_commands)} 个指令")
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
     @filter.command("lpb_info", alias={"指令详情"})
     async def command_info_direct(self, event: AstrMessageEvent, command_name: str = ""):
-        """查看特定指令的详细信息"""
+        """查看指令详情"""
         if not command_name:
-            event.set_result(
-                MessageEventResult()
-                .message("请提供指令名称，如: /lpb_info help")
-                .use_t2i(False)
-            )
+            event.set_result(MessageEventResult().message("请提供指令名称。").use_t2i(False))
             return
 
         self._refresh_commands_cache()
-        self._refresh_wake_prefix()
-
         cmd_info = None
         for name, info in self._commands_cache.items():
             if name == command_name or command_name in info["names"]:
@@ -919,175 +872,26 @@ class Main(star.Star):
                 break
 
         if not cmd_info:
-            event.set_result(
-                MessageEventResult()
-                .message(f"未找到指令「{command_name}」")
-                .use_t2i(False)
-            )
+            event.set_result(MessageEventResult().message(f"未找到指令「{command_name}」").use_t2i(False))
             return
 
-        prefix = self._get_command_prefix()
         lines = [
-            f"📋 指令详情：{prefix}{cmd_info['primary_name']}",
-            "",
+            f"📋 指令：{self._get_command_prefix()}{cmd_info['primary_name']}",
             f"描述：{cmd_info['description']}",
         ]
-
-        if cmd_info.get("is_custom"):
-            lines.append("类型：自定义指令（仅展示）")
-        elif not self._is_command_executable(cmd_info['primary_name']):
-            lines.append("状态：禁止 LLM 执行")
-
-        aliases = [n for n in cmd_info["names"] if n != cmd_info['primary_name'] and not n.startswith(" ")]
-        if aliases:
-            lines.append(f"别名：{', '.join([f'{prefix}{a}' for a in aliases])}")
-
         if cmd_info["params"]:
-            lines.append("")
             lines.append("参数：")
             for param_name, param_info in cmd_info["params"].items():
-                required = "必填" if param_info.get("required", True) else "可选"
-                default = param_info.get("default", "")
-                default_str = f" (默认: {default})" if default else ""
-                lines.append(f"  • {param_name} [{param_info['type']}] - {required}{default_str}")
-
-        lines.append("")
-        lines.append("使用示例：")
-        if cmd_info.get("is_custom") and cmd_info.get("example"):
-            lines.append(f"  {cmd_info['example']}")
-        else:
-            for example in self._generate_usage_examples(cmd_info):
-                lines.append(f"  {example}")
-
-        if cmd_info["plugin"] and not self._hide_plugin_info:
-            lines.append(f"所属插件：{cmd_info['plugin']['name']}")
-
-        lines.append(f"唤醒词：{self._get_wake_prefix_display()}")
-
-        event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
-
-    @filter.command("lpb_plugins", alias={"插件列表"})
-    async def list_plugins_direct(self, event: AstrMessageEvent):
-        """列出所有已加载的插件"""
-        self._refresh_plugins_cache()
-
-        if not self._plugins_cache:
-            event.set_result(
-                MessageEventResult().message("当前没有已加载的插件。").use_t2i(False)
-            )
-            return
-
-        lines = ["📦 已加载插件列表：", ""]
-
-        for plugin_name, plugin_info in sorted(self._plugins_cache.items()):
-            status = "✅" if plugin_info.get("activated", False) else "❌"
-            version = plugin_info.get("version", "未知")
-            author = plugin_info.get("author", "未知")
-            desc = plugin_info.get("desc", "")
-            
-            lines.append(f"{status} {plugin_name} (v{version}) by {author}")
-            if desc:
-                lines.append(f"   {desc[:50]}{'...' if len(desc) > 50 else ''}")
-
-        lines.append("")
-        lines.append(f"共 {len(self._plugins_cache)} 个插件")
-        lines.append("使用 /lpb_plugin <插件名> 查看插件详情")
-
-        event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
-
-    @filter.command("lpb_plugin", alias={"插件详情"})
-    async def plugin_info_direct(self, event: AstrMessageEvent, plugin_name: str = ""):
-        """查看特定插件的详细信息"""
-        if not plugin_name:
-            event.set_result(
-                MessageEventResult()
-                .message("请提供插件名称，如: /lpb_plugin web_searcher")
-                .use_t2i(False)
-            )
-            return
-
-        self._refresh_plugins_cache()
-        self._refresh_commands_cache()
-
-        plugin_info = None
-        for name, info in self._plugins_cache.items():
-            if name.lower() == plugin_name.lower():
-                plugin_info = info
-                break
-
-        if not plugin_info:
-            event.set_result(
-                MessageEventResult()
-                .message(f"未找到插件「{plugin_name}」")
-                .use_t2i(False)
-            )
-            return
-
-        plugin_commands = []
-        for cmd_name, cmd_info in self._commands_cache.items():
-            if cmd_info.get("plugin", {}).get("name", "").lower() == plugin_info["name"].lower():
-                plugin_commands.append(cmd_name)
-
-        lines = [
-            f"📦 插件详情：{plugin_info['name']}",
-            "",
-            f"作者：{plugin_info.get('author', '未知')}",
-            f"版本：{plugin_info.get('version', '未知')}",
-            f"状态：{'✅ 已激活' if plugin_info.get('activated', False) else '❌ 未激活'}",
-        ]
-
-        if plugin_info.get("repo"):
-            lines.append(f"仓库：{plugin_info['repo']}")
-
-        if plugin_info.get("desc"):
-            lines.append(f"")
-            lines.append(f"描述：{plugin_info['desc']}")
-
-        lines.append("")
-        lines.append(f"注册指令 ({len(plugin_commands)} 个)：")
-        if plugin_commands:
-            prefix = self._get_command_prefix()
-            for cmd in plugin_commands[:10]:
-                lines.append(f"  • {prefix}{cmd}")
-            if len(plugin_commands) > 10:
-                lines.append(f"  ... 还有 {len(plugin_commands) - 10} 个指令")
-        else:
-            lines.append("  无")
+                lines.append(f"  • {param_name}: {param_info.get('type', 'any')}")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
     @filter.command("lpb_wake", alias={"查看唤醒词"})
     async def show_wake_info(self, event: AstrMessageEvent):
-        """查看当前唤醒词配置"""
+        """查看唤醒词配置"""
         self._refresh_wake_prefix()
-
-        lines = ["📢 机器人唤醒信息", ""]
-
-        if self._wake_prefix:
-            lines.append(f"唤醒词：{self._wake_prefix}")
-            lines.append("")
-            lines.append("触发方式：")
-            lines.append(f"  • 发送「{self._wake_prefix}」开头的消息")
-            lines.append(f"  • 指令格式：{self._wake_prefix}指令名 [参数]")
-            lines.append("")
-            lines.append("示例：")
-            lines.append(f"  • {self._wake_prefix}help - 获取帮助")
-            lines.append(f"  • {self._wake_prefix}天气 北京 - 查询天气")
-        else:
-            lines.append("唤醒词：未配置")
-            lines.append("")
-            lines.append("触发方式：")
-            lines.append("  • @机器人 后发送消息")
-            lines.append("  • 私聊直接发送消息")
-            lines.append("  • 群聊中使用 / 开头的指令")
-            lines.append("")
-            lines.append("示例：")
-            lines.append("  • /help - 获取帮助")
-            lines.append("  • /天气 北京 - 查询北京天气")
-            lines.append("  • @机器人 帮助 - @后发送指令")
-
+        lines = ["📢 机器人唤醒信息", "", f"唤醒词：{self._get_wake_prefix_display()}"]
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
 
     async def terminate(self) -> None:
-        """插件卸载"""
         logger.info("LLM Plugin Bridge 已卸载")
