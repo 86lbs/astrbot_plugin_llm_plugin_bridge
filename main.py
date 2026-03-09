@@ -4,7 +4,7 @@ LLM Plugin Bridge - LLM 插件桥
 整合 LLM 与 AstrBot 插件系统的桥梁，让 LLM 能够：
 - 发现和了解所有可用的插件和指令
 - 获取唤醒词和触发方式信息
-- 获取原始消息（包含唤醒词），判断用户意图
+- 获取原始消息，判断用户意图
 - 执行插件指令（可配置权限控制）
 """
 
@@ -270,22 +270,21 @@ class Main(star.Star):
     def _save_original_message(self, session_id: str, original_message: str, processed_message: str, sender_id: str):
         """保存原始消息（包含唤醒词）"""
         self._recent_original_messages[session_id] = {
-            "original_message": original_message,  # 用户发送的原始消息（包含唤醒词）
-            "processed_message": processed_message,  # 处理后的消息（去掉唤醒词）
+            "original_message": original_message,
+            "processed_message": processed_message,
             "sender_id": sender_id,
             "timestamp": time.time(),
         }
         
-        # 清理过期记录（保留最近 100 条，5 分钟内）
+        # 清理过期记录
         current_time = time.time()
         expired_keys = [
             k for k, v in self._recent_original_messages.items()
-            if current_time - v["timestamp"] > 300  # 5 分钟
+            if current_time - v["timestamp"] > 300
         ]
         for k in expired_keys:
             del self._recent_original_messages[k]
         
-        # 如果超过 100 条，删除最旧的
         if len(self._recent_original_messages) > 100:
             sorted_keys = sorted(
                 self._recent_original_messages.keys(),
@@ -368,11 +367,8 @@ class Main(star.Star):
         self._log("[LLM Tool] get_wake_info 被调用")
         self._refresh_wake_prefix()
 
-        # 获取当前会话的原始消息
         session_id = event.session_id
         original_msg_info = self._get_original_message(session_id)
-        
-        # LLM 收到的消息
         llm_received_message = event.message_str or ""
 
         result = {
@@ -383,35 +379,28 @@ class Main(star.Star):
             },
         }
 
-        # 如果有原始消息记录
         if original_msg_info:
             result["current_session"]["original_message"] = original_msg_info["original_message"]
             result["current_session"]["message_was_modified"] = (
                 original_msg_info["original_message"] != original_msg_info["processed_message"]
             )
             
-            # 分析用户意图
             original = original_msg_info["original_message"]
             wake = self._wake_prefix or ""
             
-            # 判断是否是指令
             is_command = False
             command_name = None
             
             if wake and original.startswith(wake):
-                # 去掉唤醒词后的内容
                 after_wake = original[len(wake):].strip()
                 
-                # 检查是否匹配已知指令
                 for cmd_name in self._commands_cache.keys():
                     if after_wake.startswith(cmd_name) or after_wake == cmd_name:
                         is_command = True
                         command_name = cmd_name
                         break
                 
-                # 如果不是已知指令，分析可能的情况
                 if not is_command:
-                    # 检查是否是唤醒词+其他内容（非指令）
                     result["current_session"]["analysis"] = {
                         "is_known_command": False,
                         "possible_intent": "用户可能是在问问题或进行普通对话，而不是执行指令",
@@ -419,8 +408,6 @@ class Main(star.Star):
                         "content_after_wake": after_wake,
                     }
                     
-                    # 特殊情况：唤醒词可能是某个词的一部分
-                    # 例如 "nova14怎么样？" 中 "nova" 是 "nova14" 的一部分
                     if after_wake and not after_wake.startswith(" "):
                         result["current_session"]["analysis"]["note"] = (
                             f"唤醒词「{wake}」后面没有空格，可能是用户在提及包含唤醒词的词汇"
@@ -441,9 +428,8 @@ class Main(star.Star):
         else:
             result["current_session"]["original_message"] = llm_received_message
             result["current_session"]["message_was_modified"] = False
-            result["current_session"]["note"] = "未找到原始消息记录，可能消息未被处理过"
+            result["current_session"]["note"] = "未找到原始消息记录"
 
-        # 添加判断建议
         result["intent_judgment_guide"] = {
             "how_to_judge": [
                 "1. 比较 original_message 和 llm_received_message，判断消息是否被修改",
@@ -451,30 +437,13 @@ class Main(star.Star):
                 "3. 如果唤醒词后面不是指令名，用户可能在普通对话",
                 "4. 如果唤醒词后面没有空格，可能是用户在提及包含唤醒词的词汇",
             ],
-            "examples": [
-                {
-                    "original": f"{self._wake_prefix}天气 北京" if self._wake_prefix else "/天气 北京",
-                    "llm_receives": "天气 北京",
-                    "intent": "执行天气指令",
-                },
-                {
-                    "original": f"{self._wake_prefix}14怎么样？" if self._wake_prefix else "14怎么样？",
-                    "llm_receives": "14怎么样？",
-                    "intent": f"用户在问「{self._wake_prefix}14」相关问题，不是执行指令" if self._wake_prefix else "普通对话",
-                },
-                {
-                    "original": f"{self._wake_prefix} 你好" if self._wake_prefix else "你好",
-                    "llm_receives": "你好",
-                    "intent": "普通对话",
-                },
-            ],
         }
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="check_user_intent")
     async def check_user_intent(self, event: AstrMessageEvent) -> str:
-        """检查用户意图，判断用户是否已经通过指令方式触发了功能。在执行任何可能重复的操作之前调用此工具。"""
+        """检查用户意图，判断用户是否已经通过指令方式触发了功能。"""
         self._log("[LLM Tool] check_user_intent 被调用")
         
         sender_id = event.get_sender_id()
@@ -492,14 +461,14 @@ class Main(star.Star):
         plugin_name: str = "",
         include_params: bool = False,
     ) -> str:
-        """列出所有可用的插件指令。当用户想知道机器人能做什么、有哪些指令可用时调用此工具。
+        """列出所有可用的插件指令。
 
         Args:
-            keyword(string): 可选的关键词，用于过滤指令名称或描述中包含该关键词的指令。
+            keyword(string): 可选的关键词，用于过滤指令。
             plugin_name(string): 可选的插件名称，用于过滤特定插件的指令。
             include_params(boolean): 是否包含参数信息。
         """
-        self._log(f"[LLM Tool] list_commands 被调用, keyword={keyword}")
+        self._log(f"[LLM Tool] list_commands 被调用")
         self._refresh_commands_cache()
         self._refresh_wake_prefix()
 
@@ -573,7 +542,7 @@ class Main(star.Star):
         Args:
             command_name(string): 指令名称。
         """
-        self._log(f"[LLM Tool] get_command_details 被调用, command_name={command_name}")
+        self._log(f"[LLM Tool] get_command_details 被调用")
         self._refresh_commands_cache()
 
         cmd_info = None
@@ -629,7 +598,7 @@ class Main(star.Star):
         Args:
             plugin_name(string): 插件名称。
         """
-        self._log(f"[LLM Tool] get_plugin_info 被调用, plugin_name={plugin_name}")
+        self._log(f"[LLM Tool] get_plugin_info 被调用")
         self._refresh_plugins_cache()
         self._refresh_commands_cache()
 
@@ -666,7 +635,7 @@ class Main(star.Star):
             command_name(string): 要执行的指令名称。
             args(string): 指令参数。
         """
-        self._log(f"[LLM Tool] execute_command 被调用, command_name={command_name}")
+        self._log(f"[LLM Tool] execute_command 被调用")
 
         # 检查用户意图
         intent = self._check_user_intent(event.get_sender_id(), event.message_str or "")
@@ -754,49 +723,22 @@ class Main(star.Star):
 
     @filter.on_llm_tool_respond()
     async def on_llm_tool_respond(self, event: AstrMessageEvent, tool: FunctionTool, tool_args: dict | None, tool_result: Any):
+        """监听 LLM Tool 响应事件"""
         pass
 
-    @filter.on_command_run()
-    async def on_command_run(self, event: AstrMessageEvent):
-        """监听指令执行事件"""
-        parsed_params = event.get_extra("parsed_params") or {}
-        command_name = event.get_extra("command_name") or ""
-        
-        if command_name:
-            args_str = " ".join(str(v) for v in parsed_params.values()) if parsed_params else ""
-            self._add_command_invocation(command_name, args_str, event.get_sender_id(), event.message_str)
-
-    @filter.on_all_message()
-    async def on_all_message(self, event: AstrMessageEvent):
-        """监听所有消息，保存原始消息（包含唤醒词）"""
-        # 获取原始消息（包含唤醒词）
-        # 注意：event.message_str 可能已经是处理后的消息
-        # 我们需要从 event 的其他属性获取原始消息
-        
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, request: Any):
+        """监听 LLM 请求事件 - 保存原始消息"""
+        # 在 LLM 请求时保存原始消息
         original_message = event.message_str or ""
         
-        # 尝试获取原始消息
-        # AstrBot 可能会在 event 中保存原始消息
-        if hasattr(event, 'raw_message') and event.raw_message:
-            original_message = event.raw_message
-        elif hasattr(event, '_raw_message') and event._raw_message:
-            original_message = event._raw_message
-        elif hasattr(event, 'original_message') and event.original_message:
-            original_message = event.original_message
-        
-        # 如果有唤醒词，尝试重建原始消息
+        # 尝试重建原始消息（如果唤醒词已被去掉）
         if self._wake_prefix and event.message_str:
-            # 检查消息是否以唤醒词开头（已经被去掉的情况）
-            # 如果 LLM 收到的消息不是以唤醒词开头，可能唤醒词已被去掉
-            if not event.message_str.startswith(self._wake_prefix):
-                # 检查是否可能是唤醒词触发的消息
-                # 通过检查消息是否匹配某个指令来判断
-                message_words = event.message_str.split()
-                if message_words:
-                    first_word = message_words[0]
-                    # 如果第一个词是指令名，说明可能是唤醒词+指令
-                    if first_word in self._commands_cache:
-                        original_message = self._wake_prefix + event.message_str
+            message_words = event.message_str.split()
+            if message_words:
+                first_word = message_words[0]
+                if first_word in self._commands_cache:
+                    original_message = self._wake_prefix + event.message_str
         
         self._save_original_message(
             session_id=event.session_id,
