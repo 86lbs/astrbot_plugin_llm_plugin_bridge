@@ -20,7 +20,9 @@
   "list_mode": {
     "type": "string",
     "description": "指令列表过滤模式",
-    "default": "all"
+    "default": "all",
+    "options": ["all", "whitelist", "blacklist"],
+    "labels": ["全部", "白名单", "黑名单"]
   },
   "command_whitelist": {
     "type": "list",
