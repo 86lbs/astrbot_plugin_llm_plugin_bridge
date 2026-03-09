@@ -41,9 +41,7 @@ class Main(star.Star):
         self._wake_prefix: str = ""
 
         # ========== 调用记录 ==========
-        # 记录最近的指令调用（用户通过唤醒词+指令触发）
         self._recent_command_invocations: list[dict] = []
-        # 记录最近的 LLM 工具调用
         self._recent_llm_tool_calls: list[dict] = []
 
         # ========== 执行相关配置 ==========
@@ -287,7 +285,6 @@ class Main(star.Star):
         }
         self._recent_command_invocations.append(invocation)
         
-        # 保持最近 50 条记录
         if len(self._recent_command_invocations) > 50:
             self._recent_command_invocations = self._recent_command_invocations[-30:]
         
@@ -309,27 +306,15 @@ class Main(star.Star):
         self._log(f"[LLM Tool Call] 工具 '{tool_name}' 被调用")
 
     def _check_user_intent(self, sender_id: str, message_str: str, time_window: float = 5.0) -> dict:
-        """
-        检查用户意图：判断用户是否已经通过指令方式触发了功能
-        
-        返回：
-        - has_command: 是否有指令调用
-        - command_info: 指令调用信息
-        - should_skip_llm_execution: LLM 是否应该跳过执行
-        """
+        """检查用户意图：判断用户是否已经通过指令方式触发了功能"""
         current_time = time.time()
         
-        # 查找最近的指令调用
         for invocation in reversed(self._recent_command_invocations):
-            # 检查时间窗口（5秒内）
             if current_time - invocation["timestamp"] > time_window:
                 break
             
-            # 检查是否是同一用户
             if invocation["sender_id"] == sender_id:
-                # 检查消息内容是否匹配
                 if invocation["message_str"] and message_str:
-                    # 如果消息内容相似，说明用户是通过指令触发的
                     return {
                         "has_command": True,
                         "command_info": {
@@ -369,12 +354,12 @@ class Main(star.Star):
 
     @filter.llm_tool(name="get_wake_info")
     async def get_wake_info(self, event: AstrMessageEvent) -> str:
-        """获取机器人的唤醒信息，包括唤醒词、触发方式等。当用户问如何使用指令、如何唤醒机器人时调用此工具。
+        """获取机器人的唤醒信息。当 LLM 需要了解唤醒词、判断用户意图时调用此工具。
 
-        返回信息包括：
-        - 唤醒词（如果有配置）
-        - 触发机器人的方式
-        - 指令格式说明和使用示例
+        重要说明：
+        - 唤醒词会被 AstrBot 自动去掉，LLM 收到的消息是去掉唤醒词后的内容
+        - 例如：唤醒词为 "nova"，用户发送 "nova天气 北京"，LLM 收到的是 "天气 北京"
+        - LLM 需要根据这个信息判断用户是在执行指令还是在普通对话
         """
         self._log("[LLM Tool] get_wake_info 被调用")
         self._refresh_wake_prefix()
@@ -395,6 +380,39 @@ class Main(star.Star):
                 f"{self._wake_prefix}help - 获取帮助",
                 f"{self._wake_prefix}天气 北京 - 查询北京天气",
             ]
+            
+            # 关键信息：唤醒词会被去掉
+            result["important_note"] = (
+                f"唤醒词「{self._wake_prefix}」会被系统自动去掉。"
+                f"你收到的消息是去掉唤醒词后的内容。"
+            )
+            result["message_processing_examples"] = [
+                {
+                    "user_sent": f"{self._wake_prefix}天气 北京",
+                    "llm_receives": "天气 北京",
+                    "is_command": True,
+                    "meaning": "用户想执行天气指令",
+                },
+                {
+                    "user_sent": f"{self._wake_prefix}14怎么样？",
+                    "llm_receives": "14怎么样？",
+                    "is_command": False,
+                    "meaning": f"用户可能是在问关于「{self._wake_prefix}14」的问题，不是执行指令",
+                },
+                {
+                    "user_sent": f"{self._wake_prefix}help",
+                    "llm_receives": "help",
+                    "is_command": True,
+                    "meaning": "用户想执行 help 指令",
+                },
+            ]
+            result["how_to_judge_intent"] = (
+                f"判断用户意图的方法："
+                f"1. 如果你收到的消息开头是指令名（如「天气」「help」），用户可能在执行指令"
+                f"2. 如果消息开头不是已知指令名，用户可能是在普通对话"
+                f"3. 使用 check_user_intent 工具可以确认用户是否已通过指令触发"
+                f"4. 使用 list_commands 工具可以查看所有可用指令"
+            )
         else:
             result["trigger_methods"].extend([
                 "@机器人 后发送消息",
@@ -407,11 +425,7 @@ class Main(star.Star):
                 "/天气 北京 - 查询北京天气",
                 "@机器人 帮助 - @机器人后发送帮助",
             ]
-
-        result["note"] = (
-            "指令需要先唤醒机器人才能触发。"
-            "唤醒方式取决于管理员配置，可能是使用唤醒词、@机器人、或私聊直接触发。"
-        )
+            result["important_note"] = "未配置唤醒词，消息内容不会被修改。"
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -761,20 +775,17 @@ class Main(star.Star):
     @filter.on_llm_tool_respond()
     async def on_llm_tool_respond(self, event: AstrMessageEvent, tool: FunctionTool, tool_args: dict | None, tool_result: Any):
         """监听 LLM Tool 响应事件"""
-        pass  # 不需要额外处理
+        pass
 
     @filter.on_command_run()
     async def on_command_run(self, event: AstrMessageEvent):
         """监听指令执行事件 - 记录用户通过指令触发的行为"""
-        # 获取执行的指令信息
         parsed_params = event.get_extra("parsed_params") or {}
         command_name = event.get_extra("command_name") or ""
         
         if command_name:
-            # 构建参数字符串
             args_str = " ".join(str(v) for v in parsed_params.values()) if parsed_params else ""
             
-            # 记录指令调用
             self._add_command_invocation(
                 command_name=command_name,
                 args=args_str,
@@ -1072,7 +1083,7 @@ class Main(star.Star):
             lines.append("")
             lines.append("示例：")
             lines.append("  • /help - 获取帮助")
-            lines.append("  • /天气 北京 - 查询天气")
+            lines.append("  • /天气 北京 - 查询北京天气")
             lines.append("  • @机器人 帮助 - @后发送指令")
 
         event.set_result(MessageEventResult().message("\n".join(lines)).use_t2i(False))
