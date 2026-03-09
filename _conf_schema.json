@@ -6,7 +6,7 @@
   },
   "execute_require_admin": {
     "type": "bool",
-    "description": "LLM 执行指令时是否需要用户具有管理员权限",
+    "description": "LLM 执行指令时是否需要用户具有管理员权限。启用后，只有管理员用户才能让 LLM 执行指令。",
     "default": false
   },
   "blocked_commands": {
@@ -56,6 +56,8 @@
   "log_level": {
     "type": "string",
     "description": "工具调用日志的输出级别",
-    "default": "info"
+    "default": "info",
+    "options": ["info", "debug"],
+    "labels": ["信息", "调试"]
   }
 }
