@@ -1,12 +1,124 @@
 # 更新日志
 
+## [1.5.1] - 2025-03-10
+
+### Changed
+- 更新 README 文档，反映最新的功能和配置
+
+## [1.5.0] - 2025-03-10
+
+### Changed
+- **移除 `analysis` 字段**：返回结果不再包含会影响 LLM 判断的建议或分析
+- **消息历史保存策略调整**：保存最近 30 轮所有消息（包括用户消息和机器人回复）
+- 每个会话最多保存 60 条消息
+
+### Added
+- 新增 `on_llm_response` 事件监听，保存 LLM 响应
+- 新增 `after_message_sent` 事件监听，保存机器人发送的消息
+
+### Removed
+- 移除 `analysis.possible_intent` 字段
+- 移除 `analysis.content_after_wake` 字段
+- 移除 `analysis.note` 字段
+
+## [1.4.2] - 2025-03-10
+
+### Removed
+- 移除 `analysis.note` 字段
+
+## [1.4.1] - 2025-03-10
+
+### Removed
+- 移除 `analysis.recommendation` 字段
+
+## [1.4.0] - 2025-03-10
+
+### Added
+- **消息历史记录**：保存最近 20 条消息历史
+- **优化工具描述**：让 LLM 在有歧义时主动调用 `get_wake_info`
+
+### Changed
+- `get_wake_info` 返回结果新增 `recent_history` 字段
+- `get_wake_info` 返回结果新增 `analysis.recommendation` 字段
+
+## [1.3.5] - 2025-03-10
+
+### Fixed
+- 从 `event.message_obj.raw_message` 获取原始消息
+
+## [1.3.4] - 2025-03-10
+
+### Changed
+- `list_mode` 配置改为下拉选择（全部/白名单/黑名单）
+- `log_level` 配置改为下拉选择（信息/调试）
+
+## [1.3.3] - 2025-03-10
+
+### Fixed
+- 修复 `filter` 模块没有 `on_command_run` 和 `on_all_message` 的问题
+- 使用 `on_llm_request` 替代不存在的事件
+
+## [1.3.2] - 2025-03-10
+
+### Fixed
+- 修复 `log_level` 配置为下拉选择
+
+## [1.3.1] - 2025-03-10
+
+### Fixed
+- 修正仓库链接为正确的 GitHub 地址
+
+## [1.3.0] - 2025-03-10
+
+### Added
+- **原始消息追踪**：通过 `on_llm_request` 保存原始消息
+- `get_wake_info` 返回原始消息和处理后的消息对比
+
+### Changed
+- `get_wake_info` 返回结果新增 `message_processing_examples` 字段
+- `get_wake_info` 返回结果新增 `how_to_judge_intent` 字段
+
+## [1.2.0] - 2025-03-10
+
+### Changed
+- 改进 `get_wake_info` 工具描述
+- 添加消息处理示例，帮助 LLM 理解唤醒词被去掉的情况
+
+## [1.1.0] - 2025-03-10
+
+### Added
+- **用户意图检测**：新增 `check_user_intent` LLM 工具
+- **指令调用监听**：通过 `on_command_run` 监听用户通过指令触发的行为
+
+### Removed
+- 移除 `/lpb_history` 指令及相关功能
+
+## [1.0.5] - 2025-03-10
+
+### Fixed
+- 修复异步生成器（async generator）处理问题
+- 指令处理器返回异步生成器时正确迭代获取结果
+
+## [1.0.4] - 2025-03-10
+
+### Fixed
+- 修复配置文件格式
+
+## [1.0.3] - 2025-03-09
+
+### Fixed
+- 修复配置文件格式
+
+## [1.0.2] - 2025-03-09
+
+### Fixed
+- 修复配置文件格式
+
 ## [1.0.1] - 2025-03-09
 
 ### Fixed
 - 修复配置文件格式问题，使用完整的 JSON Schema 格式
 - 修复 list 类型需要 items 字段的问题
-- 修复 boolean 类型应为 "boolean" 而非 "bool"
-- 修复 array 类型应为 "array" 而非 "list"
 
 ## [1.0.0] - 2025-03-09
 
@@ -34,4 +146,3 @@
 - 支持自定义指令描述
 - 支持自定义虚拟指令
 - 支持工具调用日志记录
-- 支持工具调用历史查看
