@@ -16,7 +16,7 @@
     "blocked_commands": {
       "type": "array",
       "title": "禁止执行的指令",
-      "description": "禁止 LLM 执行的指令名称列表（执行黑名单）",
+      "description": "禁止 LLM 执行的指令名称列表",
       "items": {
         "type": "string"
       },
@@ -25,14 +25,14 @@
     "list_mode": {
       "type": "string",
       "title": "指令列表模式",
-      "description": "指令列表过滤模式：whitelist-白名单模式（只显示白名单中的指令），blacklist-黑名单模式（隐藏黑名单中的指令），all-显示所有指令",
+      "description": "指令列表过滤模式",
       "enum": ["all", "whitelist", "blacklist"],
       "default": "all"
     },
     "command_whitelist": {
       "type": "array",
       "title": "指令白名单",
-      "description": "白名单模式下，只显示这些指令。格式：指令名称列表",
+      "description": "白名单模式下显示的指令",
       "items": {
         "type": "string"
       },
@@ -41,49 +41,9 @@
     "command_blacklist": {
       "type": "array",
       "title": "指令黑名单",
-      "description": "黑名单模式下，隐藏这些指令。格式：指令名称列表",
+      "description": "黑名单模式下隐藏的指令",
       "items": {
         "type": "string"
-      },
-      "default": []
-    },
-    "custom_descriptions": {
-      "type": "object",
-      "title": "自定义指令描述",
-      "description": "覆盖特定指令的描述信息。格式：{\"指令名\": \"自定义描述\"}",
-      "default": {}
-    },
-    "custom_commands": {
-      "type": "array",
-      "title": "自定义指令",
-      "description": "添加自定义指令信息（仅展示，不会真正注册指令）",
-      "items": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "title": "指令名称",
-            "default": ""
-          },
-          "description": {
-            "type": "string",
-            "title": "指令描述",
-            "default": ""
-          },
-          "aliases": {
-            "type": "array",
-            "title": "别名列表",
-            "items": {
-              "type": "string"
-            },
-            "default": []
-          },
-          "example": {
-            "type": "string",
-            "title": "使用示例",
-            "default": ""
-          }
-        }
       },
       "default": []
     },
