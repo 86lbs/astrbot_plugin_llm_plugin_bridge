@@ -1,8 +1,8 @@
 {
   "allow_execute": {
     "type": "bool",
-    "description": "是否允许 LLM 通过工具执行插件指令",
-    "default": true
+    "description": "是否允许 LLM 通过工具执行插件指令（默认关闭，请按需启用）",
+    "default": false
   },
   "execute_require_admin": {
     "type": "bool",
