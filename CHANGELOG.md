@@ -1,5 +1,22 @@
 # 更新日志
 
+## [1.7.0] - 2025-03-10
+
+### Added
+- **消息投递状态追踪**：新增 `MessageDeliveryTracker` 类，追踪消息是否被转换为图片发送
+- **新增 LLM 工具 `get_message_delivery_status`**：让 LLM 能够查询最近消息的投递状态
+- **新增用户指令 `/lpb_delivery`**：用户可查看最近消息的投递状态
+- **`get_wake_info` 工具增强**：返回 `last_message_delivery` 字段，告知 LLM 上一条消息是否被转图片
+
+### Changed
+- **`MessageHistoryManager.save()` 方法增强**：支持 `extra` 参数保存额外信息
+- **`after_message_sent` 事件监听增强**：检测 `use_t2i_` 属性判断消息是否被转图片
+- **`lpb_config` 指令增强**：显示消息投递追踪状态
+
+### Technical
+- 当消息被转换为图片时，LLM 会收到明确的通知，可以据此调整回复策略
+- 解决了 LLM 不知道自己发送的消息被转换为图片的问题
+
 ## [1.6.0] - 2025-03-10
 
 ### Changed
