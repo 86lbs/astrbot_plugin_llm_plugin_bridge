@@ -6,6 +6,7 @@ LLM Plugin Bridge - LLM 插件桥
 - 获取唤醒词和触发方式信息
 - 获取原始消息历史，判断用户意图
 - 执行插件指令（可配置权限控制）
+- 获取消息投递状态（包括是否被转换为图片）
 """
 
 import inspect
@@ -34,6 +35,7 @@ class ConfigDefaults:
     MIN_INVOCATION_RECORDS = 10  # 最小记录数
     MAX_INVOCATION_RECORDS = 50
     CLEANUP_THRESHOLD = 100
+    MAX_DELIVERY_STATUS_RECORDS = 20  # 最大投递状态记录数
 
 
 # ==================== 缓存管理器 ====================
@@ -249,8 +251,16 @@ class MessageHistoryManager:
         self._expire_seconds = config.get("session_expire_seconds", ConfigDefaults.SESSION_EXPIRE_SECONDS)
         self._cleanup_threshold = config.get("cleanup_threshold", ConfigDefaults.CLEANUP_THRESHOLD)
     
-    def save(self, session_id: str, role: str, content: str, sender_name: str = "") -> None:
-        """保存消息到历史记录（带去重）"""
+    def save(self, session_id: str, role: str, content: str, sender_name: str = "", extra: dict | None = None) -> None:
+        """保存消息到历史记录（带去重和额外信息）
+        
+        Args:
+            session_id: 会话ID
+            role: 角色 (user/assistant)
+            content: 消息内容
+            sender_name: 发送者名称
+            extra: 额外信息（如 converted_to_image）
+        """
         if session_id not in self._history:
             self._history[session_id] = []
         
@@ -260,12 +270,18 @@ class MessageHistoryManager:
             if last["role"] == role and last["content"] == content:
                 return
         
-        records.append({
+        record = {
             "role": role,
             "content": content,
             "sender_name": sender_name,
             "timestamp": time.time(),
-        })
+        }
+        
+        # 添加额外信息
+        if extra:
+            record["extra"] = extra
+        
+        records.append(record)
         
         if len(records) > self._max_history:
             self._history[session_id] = records[-self._max_history:]
@@ -282,6 +298,14 @@ class MessageHistoryManager:
         if session_id not in self._history:
             return []
         return self._history[session_id][-limit:]
+    
+    def get_last_record(self, session_id: str) -> dict | None:
+        """获取最后一条记录"""
+        self._lazy_cleanup(session_id)
+        
+        if session_id not in self._history or not self._history[session_id]:
+            return None
+        return self._history[session_id][-1]
     
     def _lazy_cleanup(self, session_id: str) -> None:
         """惰性清理：检查特定会话是否过期"""
@@ -309,6 +333,64 @@ class MessageHistoryManager:
         return len(self._history)
 
 
+# ==================== 消息投递状态追踪器 ====================
+
+class MessageDeliveryTracker:
+    """消息投递状态追踪器 - 追踪消息是否被转换为图片等状态"""
+    
+    def __init__(self, config: dict):
+        self._delivery_status: dict[str, list[dict]] = {}
+        self._max_records = config.get(
+            "max_delivery_status_records", 
+            ConfigDefaults.MAX_DELIVERY_STATUS_RECORDS
+        )
+    
+    def record(self, session_id: str, original_text: str, converted_to_image: bool, 
+               text_length: int = 0, reason: str = "") -> None:
+        """记录消息投递状态
+        
+        Args:
+            session_id: 会话ID
+            original_text: 原始文本内容（可能被截断）
+            converted_to_image: 是否被转换为图片
+            text_length: 原始文本长度
+            reason: 转换原因
+        """
+        if session_id not in self._delivery_status:
+            self._delivery_status[session_id] = []
+        
+        record = {
+            "original_text": original_text[:500] if original_text else "",  # 截断保存
+            "converted_to_image": converted_to_image,
+            "text_length": text_length or len(original_text),
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        
+        self._delivery_status[session_id].append(record)
+        
+        # 限制记录数量
+        if len(self._delivery_status[session_id]) > self._max_records:
+            self._delivery_status[session_id] = self._delivery_status[session_id][-self._max_records:]
+    
+    def get_last_status(self, session_id: str) -> dict | None:
+        """获取最后一条消息的投递状态"""
+        if session_id not in self._delivery_status or not self._delivery_status[session_id]:
+            return None
+        return self._delivery_status[session_id][-1]
+    
+    def get_recent_status(self, session_id: str, limit: int = 5) -> list[dict]:
+        """获取最近的消息投递状态"""
+        if session_id not in self._delivery_status:
+            return []
+        return self._delivery_status[session_id][-limit:]
+    
+    def clear_session(self, session_id: str) -> None:
+        """清除指定会话的记录"""
+        if session_id in self._delivery_status:
+            del self._delivery_status[session_id]
+
+
 # ==================== 主插件类 ====================
 
 class Main(star.Star):
@@ -320,6 +402,7 @@ class Main(star.Star):
         
         self._cache_mgr = CacheManager(context, self._config)
         self._history_mgr = MessageHistoryManager(self._config)
+        self._delivery_tracker = MessageDeliveryTracker(self._config)
         
         self._recent_invocations: list[dict] = []
         
@@ -356,6 +439,7 @@ class Main(star.Star):
         logger.info(f"  - 唤醒词: {self._cache_mgr.get_wake_prefix_display()}")
         logger.info(f"  - 列表模式: {self._list_mode}")
         logger.info(f"  - LLM 执行功能: {'已启用' if self._allow_execute else '已禁用'}")
+        logger.info(f"  - 消息投递状态追踪: 已启用")
 
     def _log(self, message: str) -> None:
         """记录日志"""
@@ -463,7 +547,10 @@ class Main(star.Star):
 
     @filter.llm_tool(name="get_wake_info")
     async def get_wake_info(self, event: AstrMessageEvent) -> str:
-        """【重要】获取机器人的唤醒信息和消息的原始内容。"""
+        """【重要】获取机器人的唤醒信息、消息的原始内容和消息投递状态。
+        
+        此工具还会返回最近消息的投递状态，包括消息是否因为过长被转换为图片发送。
+        """
         self._log("[LLM Tool] get_wake_info 被调用")
         self._cache_mgr.refresh_wake_prefix()
         
@@ -484,6 +571,20 @@ class Main(star.Star):
             },
         }
         
+        # 获取消息投递状态
+        last_delivery = self._delivery_tracker.get_last_status(session_id)
+        if last_delivery:
+            result["last_message_delivery"] = {
+                "converted_to_image": last_delivery.get("converted_to_image", False),
+                "text_length": last_delivery.get("text_length", 0),
+                "reason": last_delivery.get("reason", ""),
+            }
+            if last_delivery.get("converted_to_image"):
+                result["last_message_delivery"]["notice"] = (
+                    "您上一条发送的消息因为过长已被转换为图片发送给用户。"
+                    "用户看到的是图片而非文本。"
+                )
+        
         history = self._history_mgr.get(session_id, 61)
         if len(history) > 1:
             result["recent_history"] = [
@@ -498,6 +599,58 @@ class Main(star.Star):
         """检查用户意图，判断用户是否已经通过指令方式触发了功能。"""
         self._log("[LLM Tool] check_user_intent 被调用")
         return json.dumps(self._check_intent(event.get_sender_id(), event.message_str or ""), ensure_ascii=False, indent=2)
+
+    @filter.llm_tool(name="get_message_delivery_status")
+    async def get_message_delivery_status(self, event: AstrMessageEvent, count: int = 3) -> str:
+        """获取最近消息的投递状态，包括是否被转换为图片。
+        
+        当您怀疑自己发送的消息可能因为过长被转换为图片时，可以调用此工具确认。
+        
+        Args:
+            count(integer): 要获取的最近消息数量，默认为3，最大为10。
+        """
+        self._log("[LLM Tool] get_message_delivery_status 被调用")
+        
+        session_id = event.session_id
+        count = min(max(count, 1), 10)  # 限制在 1-10 之间
+        
+        recent_status = self._delivery_tracker.get_recent_status(session_id, count)
+        
+        if not recent_status:
+            return json.dumps({
+                "has_records": False,
+                "message": "当前会话没有消息投递状态记录。"
+            }, ensure_ascii=False, indent=2)
+        
+        records = []
+        for i, status in enumerate(reversed(recent_status)):  # 按时间正序
+            record = {
+                "index": len(recent_status) - i,
+                "converted_to_image": status.get("converted_to_image", False),
+                "text_length": status.get("text_length", 0),
+                "timestamp": status.get("timestamp"),
+            }
+            
+            if status.get("converted_to_image"):
+                record["notice"] = "此消息已被转换为图片发送"
+                record["original_text_preview"] = status.get("original_text", "")[:200]
+            
+            records.append(record)
+        
+        # 统计转换次数
+        converted_count = sum(1 for s in recent_status if s.get("converted_to_image"))
+        
+        result = {
+            "has_records": True,
+            "total_records": len(records),
+            "converted_to_image_count": converted_count,
+            "records": records,
+        }
+        
+        if converted_count > 0:
+            result["summary"] = f"在最近 {len(records)} 条消息中，有 {converted_count} 条因过长被转换为图片发送。"
+        
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     @filter.llm_tool(name="list_commands")
     async def list_commands(self, event: AstrMessageEvent, keyword: str = "", plugin_name: str = "", include_params: bool = False) -> str:
@@ -790,14 +943,66 @@ class Main(star.Star):
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent, result: MessageEventResult):
-        """监听消息发送事件"""
-        if result and result.chain:
+        """监听消息发送事件，检测消息是否被转换为图片"""
+        if not result:
+            return
+        
+        session_id = event.session_id
+        text = ""
+        
+        # 提取文本内容
+        if result.chain:
             text = ''.join(
                 getattr(c, 'text', '') or (c.data.get('text', '') if isinstance(getattr(c, 'data', None), dict) else '')
                 for c in result.chain
             )
-            if text:
-                self._history_mgr.save(event.session_id, "assistant", text, "机器人")
+        
+        # 检测是否被转换为图片
+        converted_to_image = False
+        reason = ""
+        
+        # 方法1：检查 use_t2i_ 属性
+        if hasattr(result, 'use_t2i_') and result.use_t2i_ is True:
+            converted_to_image = True
+            reason = "文本转图片功能已启用 (use_t2i_=True)"
+        
+        # 方法2：检查 chain 中是否只有 Image 组件没有 Plain 组件
+        if not converted_to_image and result.chain:
+            has_plain = any(hasattr(c, 'text') for c in result.chain)
+            has_image = any(
+                c.__class__.__name__ == 'Image' or 
+                hasattr(c, 'url') or 
+                hasattr(c, 'path')
+                for c in result.chain
+            )
+            
+            # 如果有图片但没有文本，可能是被转换了
+            if has_image and not has_plain and text:
+                converted_to_image = True
+                reason = "消息链中只有图片组件，原始文本可能被转换"
+        
+        # 记录投递状态
+        if text or converted_to_image:
+            self._delivery_tracker.record(
+                session_id=session_id,
+                original_text=text,
+                converted_to_image=converted_to_image,
+                text_length=len(text),
+                reason=reason
+            )
+            
+            # 如果被转换为图片，在历史记录中添加标记
+            if converted_to_image:
+                self._history_mgr.save(
+                    session_id, 
+                    "assistant", 
+                    text, 
+                    "机器人",
+                    extra={"converted_to_image": True, "reason": reason}
+                )
+                self._log(f"[MessageDelivery] 会话 {session_id} 的消息被转换为图片发送，原文长度: {len(text)}")
+            else:
+                self._history_mgr.save(session_id, "assistant", text, "机器人")
 
     # ==================== 用户指令 ====================
 
@@ -814,7 +1019,9 @@ class Main(star.Star):
             f"  指令数量: {len(self._cache_mgr.commands)}",
             f"  插件数量: {len(self._cache_mgr.plugins)}",
             f"  唤醒词: {self._cache_mgr.get_wake_prefix_display()}",
-            f"  会话历史: {self._history_mgr.session_count} 个会话",
+            f"  会话历史: {self._history_mgr.session_count} 个会话", "",
+            "【消息投递追踪】",
+            f"  状态: ✅ 已启用",
         ]
         event.set_result(event.plain_result("\n".join(lines)))
 
@@ -879,6 +1086,35 @@ class Main(star.Star):
         """查看唤醒词配置"""
         self._cache_mgr.refresh_wake_prefix()
         event.set_result(event.plain_result(f"📢 机器人唤醒信息\n\n唤醒词：{self._cache_mgr.get_wake_prefix_display()}"))
+
+    @filter.command("lpb_delivery", alias={"投递状态"})
+    async def show_delivery_status(self, event: AstrMessageEvent, count: int = 5):
+        """查看最近消息的投递状态"""
+        session_id = event.session_id
+        count = min(max(count, 1), 10)
+        
+        recent_status = self._delivery_tracker.get_recent_status(session_id, count)
+        
+        if not recent_status:
+            event.set_result(event.plain_result("当前会话没有消息投递状态记录。"))
+            return
+        
+        lines = ["📊 最近消息投递状态：", ""]
+        
+        for i, status in enumerate(reversed(recent_status)):
+            idx = len(recent_status) - i
+            converted = status.get("converted_to_image", False)
+            text_len = status.get("text_length", 0)
+            
+            status_icon = "🖼️" if converted else "📝"
+            lines.append(f"  {idx}. {status_icon} 长度: {text_len}")
+            if converted:
+                lines.append(f"      ⚠️ 已转换为图片发送")
+        
+        converted_count = sum(1 for s in recent_status if s.get("converted_to_image"))
+        lines.append(f"\n共 {len(recent_status)} 条记录，{converted_count} 条被转换为图片")
+        
+        event.set_result(event.plain_result("\n".join(lines)))
 
     async def terminate(self) -> None:
         logger.info("LLM Plugin Bridge 已卸载")
