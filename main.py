@@ -10,6 +10,7 @@ LLM Plugin Bridge - LLM 插件桥
 
 import inspect
 import json
+import shlex
 import time
 from typing import Any
 
@@ -19,6 +20,7 @@ from astrbot.api.star import Context
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
+from astrbot.core.star.star import star_map
 from astrbot.core.agent.tool import FunctionTool
 
 
@@ -268,13 +270,24 @@ class MessageHistoryManager:
             self._operation_count = 0
     
     def get(self, session_id: str, limit: int = 10) -> list[dict]:
-        """获取消息历史"""
+        """获取消息历史（带惰性清理）"""
+        # 惰性清理：在获取时检查并清理过期会话
+        self._lazy_cleanup(session_id)
+        
         if session_id not in self._history:
             return []
         return self._history[session_id][-limit:]
     
+    def _lazy_cleanup(self, session_id: str) -> None:
+        """惰性清理：检查特定会话是否过期"""
+        if session_id in self._history:
+            records = self._history[session_id]
+            if records:
+                if time.time() - records[-1]["timestamp"] > self._expire_seconds:
+                    del self._history[session_id]
+    
     def _cleanup_expired(self) -> None:
-        """清理过期会话"""
+        """批量清理过期会话"""
         current_time = time.time()
         expired = [
             sid for sid, records in self._history.items()
@@ -432,9 +445,8 @@ class Main(star.Star):
         for inv in reversed(self._recent_invocations):
             if current - inv["timestamp"] > self._intent_time_window:
                 break
-            # 改进：检查是否是同一用户且消息内容相关
+            # 检查是否是同一用户且消息内容相关
             if inv["sender_id"] == sender_id:
-                # 检查消息是否包含指令名或相关内容
                 cmd = inv["command"].lower()
                 msg_lower = msg.lower()
                 if cmd in msg_lower or inv["message_str"].lower() in msg_lower:
@@ -690,7 +702,7 @@ class Main(star.Star):
         if cmd_info.get("is_custom"):
             return "错误：自定义指令无法执行。"
         
-        # 使用主命令名进行黑名单检查（修复别名绕过问题）
+        # 使用主命令名进行黑名单检查
         primary_name = cmd_info["primary_name"]
         if not self._is_executable(primary_name):
             return f"错误：指令「{primary_name}」已被禁止执行。"
@@ -699,15 +711,18 @@ class Main(star.Star):
             handler_md = cmd_info["handler_md"]
             command_filter = cmd_info["command_filter"]
             
-            args_list = args.split() if args else []
+            # 使用 shlex.split 正确解析参数（支持引号包裹的参数）
+            try:
+                args_list = shlex.split(args) if args else []
+            except ValueError as e:
+                return f"参数解析错误: {str(e)}"
+            
             try:
                 parsed_params = command_filter.validate_and_convert_params(args_list, command_filter.handler_params)
             except ValueError as e:
                 return f"参数错误: {str(e)}"
             
-            from astrbot.core.star.star import star_map
-            star_info = star_map.get(handler_md.handler_module_path)
-            if not star_info or not star_info.star_cls_type:
+            if not star_map.get(handler_md.handler_module_path):
                 return "错误：无法获取插件实例。"
             
             handler = handler_md.handler
@@ -748,7 +763,6 @@ class Main(star.Star):
         
         except Exception as e:
             logger.error(f"执行指令时发生错误: {e}", exc_info=True)
-            # 模糊错误信息，不暴露内部细节
             return "执行失败：指令执行过程中发生错误，请查看日志获取详情。"
 
     # ==================== 事件监听 ====================
