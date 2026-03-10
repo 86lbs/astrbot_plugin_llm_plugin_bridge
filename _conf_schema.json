@@ -6,7 +6,7 @@
   },
   "execute_require_admin": {
     "type": "bool",
-    "description": "LLM 执行指令时是否需要用户具有管理员权限。启用后，只有管理员用户才能让 LLM 执行指令。",
+    "description": "LLM 执行指令时是否需要用户具有管理员权限",
     "default": false
   },
   "blocked_commands": {
@@ -61,5 +61,30 @@
     "default": "info",
     "options": ["info", "debug"],
     "labels": ["信息", "调试"]
+  },
+  "max_history_per_session": {
+    "type": "int",
+    "description": "每个会话保留的最大消息数",
+    "default": 60
+  },
+  "session_expire_seconds": {
+    "type": "int",
+    "description": "会话过期时间（秒），超时无活动的会话将被清理",
+    "default": 1800
+  },
+  "intent_time_window": {
+    "type": "float",
+    "description": "意图检测时间窗口（秒），用于判断用户是否已通过指令触发功能",
+    "default": 5.0
+  },
+  "max_invocation_records": {
+    "type": "int",
+    "description": "最大指令调用记录数",
+    "default": 50
+  },
+  "cleanup_threshold": {
+    "type": "int",
+    "description": "清理阈值，每多少次操作触发一次过期会话清理",
+    "default": 100
   }
 }
