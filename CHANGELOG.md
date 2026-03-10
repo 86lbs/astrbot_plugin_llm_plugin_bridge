@@ -1,5 +1,23 @@
 # 更新日志
 
+## [1.6.0] - 2025-03-10
+
+### Changed
+- **代码重构**：抽离 `CacheManager` 类管理缓存，`MessageHistoryManager` 类管理消息历史
+- **简化 `_get_raw_message` 方法**：减少嵌套层级，提高可读性
+- **修复异步生成器结果吞噬问题**：`execute_command` 现在会收集所有 yield 结果
+
+### Added
+- **新增配置项**：
+  - `max_history_per_session`: 每会话最大消息数（默认 60）
+  - `session_expire_seconds`: 会话过期时间（默认 1800 秒）
+  - `intent_time_window`: 意图检测时间窗口（默认 5.0 秒）
+  - `max_invocation_records`: 最大调用记录数（默认 50）
+  - `cleanup_threshold`: 清理阈值（默认 100）
+
+### Fixed
+- **优化会话清理性能**：使用操作计数器触发清理，避免每次操作都遍历
+
 ## [1.5.2] - 2025-03-10
 
 ### Changed
