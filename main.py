@@ -31,6 +31,7 @@ class ConfigDefaults:
     MAX_HISTORY_PER_SESSION = 60
     SESSION_EXPIRE_SECONDS = 1800
     INTENT_TIME_WINDOW = 5.0
+    MIN_INVOCATION_RECORDS = 10  # 最小记录数
     MAX_INVOCATION_RECORDS = 50
     CLEANUP_THRESHOLD = 100
 
@@ -105,7 +106,6 @@ class CacheManager:
             
             primary_name = command_filter.command_name
             
-            # 检查是否已存在同名指令，记录警告
             if primary_name in self._commands_cache:
                 logger.warning(f"指令名称冲突: '{primary_name}' 已存在，将被覆盖")
             
@@ -184,6 +184,10 @@ class CacheManager:
             if not cmd_name:
                 continue
             
+            # 检测冲突
+            if cmd_name in self._commands_cache:
+                logger.warning(f"自定义指令 '{cmd_name}' 与现有指令冲突，将覆盖")
+            
             params_info = {}
             if "params" in custom_cmd:
                 for param_name, param_info in custom_cmd["params"].items():
@@ -218,6 +222,11 @@ class CacheManager:
     def wake_prefix(self) -> str:
         return self._wake_prefix
     
+    @property
+    def hide_plugin_info(self) -> bool:
+        """公开属性：是否隐藏插件信息"""
+        return self._hide_plugin_info
+    
     def get_wake_prefix_display(self) -> str:
         """获取唤醒词显示文本"""
         return self._wake_prefix if self._wake_prefix else "无唤醒词（@机器人 或私聊即可触发）"
@@ -245,12 +254,11 @@ class MessageHistoryManager:
         if session_id not in self._history:
             self._history[session_id] = []
         
-        # 去重：检查最后一条消息是否相同
         records = self._history[session_id]
         if records:
             last = records[-1]
             if last["role"] == role and last["content"] == content:
-                return  # 跳过重复消息
+                return
         
         records.append({
             "role": role,
@@ -259,11 +267,9 @@ class MessageHistoryManager:
             "timestamp": time.time(),
         })
         
-        # 限制历史记录数量
         if len(records) > self._max_history:
             self._history[session_id] = records[-self._max_history:]
         
-        # 使用计数器触发清理
         self._operation_count += 1
         if self._operation_count >= self._cleanup_threshold:
             self._cleanup_expired()
@@ -271,7 +277,6 @@ class MessageHistoryManager:
     
     def get(self, session_id: str, limit: int = 10) -> list[dict]:
         """获取消息历史（带惰性清理）"""
-        # 惰性清理：在获取时检查并清理过期会话
         self._lazy_cleanup(session_id)
         
         if session_id not in self._history:
@@ -313,36 +318,34 @@ class Main(star.Star):
         super().__init__(context)
         self._config = config or {}
         
-        # 初始化管理器
         self._cache_mgr = CacheManager(context, self._config)
         self._history_mgr = MessageHistoryManager(self._config)
         
-        # 调用记录
         self._recent_invocations: list[dict] = []
         
-        # 执行配置 - 默认关闭执行功能（安全考虑）
         self._allow_execute = self._config.get("allow_execute", False)
         self._execute_require_admin = self._config.get("execute_require_admin", False)
         self._blocked_commands = set(self._config.get("blocked_commands", []))
         
-        # 列表过滤配置
         self._list_mode = self._config.get("list_mode", "all")
         self._command_whitelist = set(self._config.get("command_whitelist", []))
         self._command_blacklist = set(self._config.get("command_blacklist", []))
         
-        # 显示配置
         self._show_wake_prefix = self._config.get("show_wake_prefix_in_list", True)
         
-        # 日志配置
         self._enable_logging = self._config.get("enable_tool_logging", True)
         self._log_level = self._config.get("log_level", "info")
         
-        # 意图检测时间窗口
         self._intent_time_window = self._config.get("intent_time_window", ConfigDefaults.INTENT_TIME_WINDOW)
         
-        # 缓存刷新节流
+        # 最大记录数，确保最小值
+        self._max_invocation_records = max(
+            self._config.get("max_invocation_records", ConfigDefaults.MAX_INVOCATION_RECORDS),
+            ConfigDefaults.MIN_INVOCATION_RECORDS
+        )
+        
         self._last_cache_refresh = 0
-        self._cache_refresh_interval = 5.0  # 最小刷新间隔（秒）
+        self._cache_refresh_interval = 5.0
 
     async def initialize(self) -> None:
         """插件初始化"""
@@ -368,8 +371,6 @@ class Main(star.Star):
             self._cache_mgr.refresh_all()
             self._last_cache_refresh = current
 
-    # ==================== 辅助方法 ====================
-
     def _is_visible(self, cmd_name: str) -> bool:
         """检查指令是否可见"""
         if self._list_mode == "whitelist":
@@ -379,11 +380,11 @@ class Main(star.Star):
         return True
 
     def _is_executable(self, primary_name: str) -> bool:
-        """检查指令是否可执行（使用主命令名）"""
+        """检查指令是否可执行"""
         return primary_name not in self._blocked_commands
 
     def _get_raw_message(self, event: AstrMessageEvent) -> str:
-        """获取原始消息（简化版）"""
+        """获取原始消息"""
         msg_obj = getattr(event, 'message_obj', None)
         if not msg_obj:
             return event.message_str or ""
@@ -434,9 +435,9 @@ class Main(star.Star):
             "timestamp": time.time(),
         })
         
-        max_records = self._config.get("max_invocation_records", ConfigDefaults.MAX_INVOCATION_RECORDS)
-        if len(self._recent_invocations) > max_records:
-            self._recent_invocations = self._recent_invocations[-max_records//2:]
+        # 确保清理逻辑正确（max_records 已确保 >= MIN_INVOCATION_RECORDS）
+        if len(self._recent_invocations) > self._max_invocation_records:
+            self._recent_invocations = self._recent_invocations[-self._max_invocation_records // 2:]
 
     def _check_intent(self, sender_id: str, msg: str) -> dict:
         """检查用户意图"""
@@ -445,7 +446,6 @@ class Main(star.Star):
         for inv in reversed(self._recent_invocations):
             if current - inv["timestamp"] > self._intent_time_window:
                 break
-            # 检查是否是同一用户且消息内容相关
             if inv["sender_id"] == sender_id:
                 cmd = inv["command"].lower()
                 msg_lower = msg.lower()
@@ -463,20 +463,7 @@ class Main(star.Star):
 
     @filter.llm_tool(name="get_wake_info")
     async def get_wake_info(self, event: AstrMessageEvent) -> str:
-        """【重要】获取机器人的唤醒信息和消息的原始内容。
-
-        **必须在以下情况调用此工具：**
-        1. 用户消息内容存在歧义，可能是指令也可能是普通对话
-        2. 用户消息看起来像指令但不确定是否真的是指令
-        3. 用户消息开头是指令名但可能是误触发
-        4. 需要确认用户真实意图时
-
-        返回信息包括：
-        - 唤醒词配置
-        - 用户发送的原始消息（包含唤醒词）
-        - LLM 收到的消息（去掉唤醒词后）
-        - 最近的消息历史
-        """
+        """【重要】获取机器人的唤醒信息和消息的原始内容。"""
         self._log("[LLM Tool] get_wake_info 被调用")
         self._cache_mgr.refresh_wake_prefix()
         
@@ -484,7 +471,6 @@ class Main(star.Star):
         raw_msg = self._get_raw_message(event)
         llm_msg = event.message_str or ""
         
-        # 保存消息（去重由 MessageHistoryManager 处理）
         self._history_mgr.save(session_id, "user", raw_msg, event.get_sender_name())
         
         result = {
@@ -550,10 +536,9 @@ class Main(star.Star):
             if include_params and info["params"]:
                 entry["params"] = info["params"]
             
-            if info["plugin"] and not self._cache_mgr._hide_plugin_info:
+            if info["plugin"] and not self._cache_mgr.hide_plugin_info:
                 entry["plugin"] = info["plugin"]["name"]
             
-            # 统一 is_custom 字段格式
             entry["is_custom"] = info["is_custom"]
             if not info["is_custom"]:
                 entry["executable"] = self._is_executable(info["primary_name"])
@@ -561,8 +546,11 @@ class Main(star.Star):
             commands.append(entry)
         
         if not commands:
-            msg = f"没有找到包含关键词「{keyword}」的指令。" if keyword else (f"没有找到插件「{plugin_name}」的指令。" if plugin_name else "当前没有可用的指令。")
-            return msg
+            if keyword:
+                return f"没有找到包含关键词「{keyword}」的指令。"
+            if plugin_name:
+                return f"没有找到插件「{plugin_name}」的指令。"
+            return "当前没有可用的指令。"
         
         result = {"total": len(commands), "commands": commands}
         if self._show_wake_prefix:
@@ -601,7 +589,7 @@ class Main(star.Star):
             "usage_examples": self._generate_examples(cmd_info),
         }
         
-        if cmd_info["plugin"] and not self._cache_mgr._hide_plugin_info:
+        if cmd_info["plugin"] and not self._cache_mgr.hide_plugin_info:
             result["plugin"] = cmd_info["plugin"]["name"]
         
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -674,11 +662,11 @@ class Main(star.Star):
         """
         self._log("[LLM Tool] execute_command 被调用")
         
-        # 记录此次调用
-        self._add_invocation(command_name, args, event.get_sender_id(), event.message_str or "")
+        sender_id = event.get_sender_id()
+        msg = event.message_str or ""
         
-        # 意图检查
-        intent = self._check_intent(event.get_sender_id(), event.message_str or "")
+        # 【修复】先做意图检查，再记录调用
+        intent = self._check_intent(sender_id, msg)
         if intent["should_skip_llm_execution"]:
             return f"跳过执行：{intent['reason']}"
         
@@ -702,7 +690,6 @@ class Main(star.Star):
         if cmd_info.get("is_custom"):
             return "错误：自定义指令无法执行。"
         
-        # 使用主命令名进行黑名单检查
         primary_name = cmd_info["primary_name"]
         if not self._is_executable(primary_name):
             return f"错误：指令「{primary_name}」已被禁止执行。"
@@ -711,7 +698,6 @@ class Main(star.Star):
             handler_md = cmd_info["handler_md"]
             command_filter = cmd_info["command_filter"]
             
-            # 使用 shlex.split 正确解析参数（支持引号包裹的参数）
             try:
                 args_list = shlex.split(args) if args else []
             except ValueError as e:
@@ -730,7 +716,6 @@ class Main(star.Star):
             
             result = handler(event, **parsed_params)
             
-            # 收集所有结果
             results = []
             if inspect.isasyncgen(result):
                 async for item in result:
@@ -750,6 +735,9 @@ class Main(star.Star):
                         output_parts.append(text)
                 elif isinstance(r, str):
                     output_parts.append(r)
+            
+            # 【修复】执行成功后再记录调用
+            self._add_invocation(command_name, args, sender_id, msg)
             
             if output_parts:
                 return f"执行成功: {' '.join(output_parts)}"
@@ -788,9 +776,14 @@ class Main(star.Star):
         """监听 LLM 响应事件"""
         text = ""
         if response:
-            text = getattr(response, 'completion_text', None) or getattr(response, 'text', None)
-            if not text:
-                text = response if isinstance(response, str) else response.get('text', '') if isinstance(response, dict) else ''
+            if hasattr(response, 'completion_text'):
+                text = response.completion_text
+            elif hasattr(response, 'text'):
+                text = response.text
+            elif isinstance(response, str):
+                text = response
+            elif isinstance(response, dict):
+                text = response.get('text', '') or response.get('content', '')
         
         if text:
             self._history_mgr.save(event.session_id, "assistant", text, "机器人")
